@@ -9,10 +9,32 @@ from typing import Iterable
 
 import pandas as pd
 from flask import Flask, redirect, render_template, request, url_for
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 DEFAULT_PARQUET = os.getenv("PARQUET_PATH", "data/processed/arsuppgjor_combined.parquet")
 
 app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "change-me")
+
+REYKJAVIK_PREFIX = os.getenv("REYKJAVIK_PREFIX", "").rstrip("/")
+if REYKJAVIK_PREFIX:
+    app.config["APPLICATION_ROOT"] = REYKJAVIK_PREFIX
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_prefix=1)
+
+    class PrefixMiddleware:
+        def __init__(self, app, prefix: str):
+            self.app = app
+            self.prefix = prefix
+
+        def __call__(self, environ, start_response):
+            script_name = self.prefix
+            path_info = environ.get("PATH_INFO", "")
+            if path_info.startswith(script_name):
+                environ["SCRIPT_NAME"] = script_name
+                environ["PATH_INFO"] = path_info[len(script_name):] or "/"
+            return self.app(environ, start_response)
+
+    app.wsgi_app = PrefixMiddleware(app.wsgi_app, REYKJAVIK_PREFIX)
 
 DISPLAY_NAMES = {
     "year": "Year",
