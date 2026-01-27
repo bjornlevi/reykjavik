@@ -413,7 +413,11 @@ def index():
             totals_display_neg = _format_number(totals["sum_neg"])
 
     if year != "all" and "year" in df.columns:
-        year_filtered = df[df["year"].astype(str) == year]
+        try:
+            mask = df["year"].astype(str).to_numpy() == year
+            year_filtered = df.loc[mask]
+        except Exception:
+            year_filtered = df
     else:
         year_filtered = df
     filter_values = _top_filter_values(year_filtered, category, limit=50)
