@@ -7,6 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
+import duckdb
 import pandas as pd
 from flask import Flask, redirect, render_template, request, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -38,7 +39,7 @@ if REYKJAVIK_PREFIX:
 
 DISPLAY_NAMES = {
     "year": "Year",
-        "ingested_at": "Ingested",
+    "ingested_at": "Ingested",
     "samtala0": "Institution",
     "samtala1": "Division",
     "samtala2": "Department",
@@ -64,13 +65,6 @@ CLICKABLE_COLUMNS = {
 
 def _display_name(col: str) -> str:
     return DISPLAY_NAMES.get(col, col)
-
-
-def _is_numeric_series(series: pd.Series) -> bool:
-    if series.empty:
-        return False
-    numeric = _coerce_numeric(series)
-    return numeric.notna().mean() >= 0.6
 
 
 def _is_excluded_column(name: str) -> bool:
@@ -104,19 +98,35 @@ def _is_excluded_column(name: str) -> bool:
     return name.startswith("x")
 
 
-def _numeric_candidates(df: pd.DataFrame) -> list[str]:
+def _get_columns(con: duckdb.DuckDBPyConnection) -> list[str]:
+    try:
+        rows = con.execute("PRAGMA table_info('arsuppgjor')").fetchall()
+        return [row[1] for row in rows]
+    except Exception:
+        return []
+
+
+def _numeric_expr(column: str) -> str:
+    return f"TRY_CAST(REPLACE(REPLACE({column}, '.', ''), ',', '.') AS DOUBLE)"
+
+
+def _numeric_candidates(con: duckdb.DuckDBPyConnection) -> list[str]:
     candidates = []
-    for col in df.columns:
-        if _is_excluded_column(col):
+    try:
+        rows = con.execute("DESCRIBE arsuppgjor").fetchall()
+    except Exception:
+        return candidates
+    for name, dtype, *_ in rows:
+        if _is_excluded_column(name):
             continue
-        if col in {"year"}:
+        if name in {"year"}:
             continue
-        if _is_numeric_series(df[col].dropna().head(500)):
-            candidates.append(col)
+        if any(token in dtype.lower() for token in ("int", "double", "decimal", "float")):
+            candidates.append(name)
     return candidates
 
 
-def _category_candidates(df: pd.DataFrame) -> list[str]:
+def _category_candidates(con: duckdb.DuckDBPyConnection) -> list[str]:
     allowed = {
         "fyrirtaeki",
         "samtala0",
@@ -128,97 +138,76 @@ def _category_candidates(df: pd.DataFrame) -> list[str]:
         "tegund3",
     }
     categories = []
-    for col in df.columns:
+    for col in allowed:
         if _is_excluded_column(col):
             continue
-        if col in {"source_file", "source_url", "ingested_at"}:
+        try:
+            distinct = con.execute(
+                f"SELECT COUNT(DISTINCT {col}) FROM arsuppgjor WHERE {col} IS NOT NULL"
+            ).fetchone()[0]
+        except Exception:
             continue
-        if col in {"year"}:
-            continue
-        if col not in allowed:
-            continue
-        # Prefer low-cardinality columns for categories
-        distinct = df[col].nunique(dropna=True)
         if 1 < distinct <= 200:
             categories.append(col)
-    return categories
+    return sorted(categories)
 
 
 @lru_cache(maxsize=1)
-def load_data(parquet_path: str) -> pd.DataFrame:
+def get_connection(parquet_path: str) -> duckdb.DuckDBPyConnection:
     path = Path(parquet_path)
+    con = duckdb.connect(database=":memory:")
     if not path.exists():
-        return pd.DataFrame()
-    df = pd.read_parquet(path, dtype_backend="numpy_nullable")
-    # Force object dtype for string-like columns to avoid pyarrow string ops in filters.
-    for col in df.columns:
-        if pd.api.types.is_string_dtype(df[col]) or df[col].dtype == object:
-            df[col] = df[col].astype(object)
-    return df
+        return con
+    con.execute("PRAGMA threads=4")
+    con.execute(f"CREATE OR REPLACE VIEW arsuppgjor AS SELECT * FROM read_parquet('{str(path)}')")
+    return con
 
 
-def _available_years(df: pd.DataFrame) -> list[int]:
-    if "year" not in df.columns:
+def _table_exists(con: duckdb.DuckDBPyConnection) -> bool:
+    try:
+        con.execute("SELECT 1 FROM arsuppgjor LIMIT 1")
+        return True
+    except Exception:
+        return False
+
+
+def _available_years(con: duckdb.DuckDBPyConnection) -> list[int]:
+    try:
+        rows = con.execute(
+            "SELECT DISTINCT year FROM arsuppgjor WHERE year IS NOT NULL ORDER BY year"
+        ).fetchall()
+        return [int(row[0]) for row in rows]
+    except Exception:
         return []
-    years = pd.to_numeric(df["year"], errors="coerce").dropna().astype(int)
-    return sorted(years.unique().tolist())
 
 
-def _apply_filters(
-    df: pd.DataFrame,
-    year: str | None,
-    category: str | None,
-    value: str | None,
-    filter_value: str | None,
-) -> pd.DataFrame:
-    filtered = df
-    if year and year != "all" and "year" in filtered.columns:
-        year_value = pd.to_numeric(year, errors="coerce")
-        if pd.notna(year_value):
-            year_series = pd.to_numeric(filtered["year"], errors="coerce")
-            filtered = filtered[year_series == year_value]
+def _build_where(year: str, category: str, filter_value: str) -> tuple[str, list]:
+    clauses = []
+    params: list = []
+    if year and year != "all":
+        try:
+            year_value = int(year)
+            clauses.append("year = ?")
+            params.append(year_value)
+        except ValueError:
+            pass
     if category and category != "none" and filter_value and filter_value != "all":
-        if category in filtered.columns:
-            series = filtered[category].astype(object).fillna("")
-            mask = series == filter_value
-            filtered = filtered.loc[mask]
-    if value and value in filtered.columns:
-        # Coerce to numeric for aggregation
-        filtered = filtered.copy()
-        filtered[value] = _coerce_numeric(filtered[value])
-    return filtered
+        clauses.append(f"{category} = ?")
+        params.append(filter_value)
+    where_sql = " AND ".join(clauses)
+    if where_sql:
+        where_sql = "WHERE " + where_sql
+    return where_sql, params
 
 
-def _value_options(df: pd.DataFrame) -> list[str]:
-    candidates = _numeric_candidates(df)
-    # Ensure deterministic ordering
+def _value_options(con: duckdb.DuckDBPyConnection) -> list[str]:
+    candidates = _numeric_candidates(con)
     return sorted(candidates)
 
 
-def _category_options(df: pd.DataFrame) -> list[str]:
-    candidates = _category_candidates(df)
+def _category_options(con: duckdb.DuckDBPyConnection) -> list[str]:
+    candidates = _category_candidates(con)
     return sorted(candidates)
-
-
-def _filter_values(df: pd.DataFrame, category: str | None) -> list[str]:
-    if not category or category == "none" or category not in df.columns:
-        return []
-    values = df[category].dropna().astype(str).unique().tolist()
-    values.sort()
-    return values
-
-
-def _top_filter_values(df: pd.DataFrame, category: str, limit: int = 50) -> list[tuple[str, int]]:
-    if category not in df.columns:
-        return []
-    counts = (
-        df[category]
-        .dropna()
-        .astype(str)
-        .value_counts()
-        .head(limit)
-    )
-    return list(zip(counts.index.tolist(), counts.values.tolist()))
 
 
 def _select_preview_columns(
@@ -309,10 +298,6 @@ def _parse_number(value) -> float | None:
         return None
 
 
-def _coerce_numeric(series: pd.Series) -> pd.Series:
-    return pd.to_numeric(series.apply(_parse_number), errors="coerce")
-
-
 def _build_links(
     items: Iterable,
     current: str,
@@ -341,9 +326,8 @@ def _build_links(
 @app.route("/")
 def index():
     parquet_path = DEFAULT_PARQUET
-    df = load_data(parquet_path)
-
-    if df.empty:
+    con = get_connection(parquet_path)
+    if not _table_exists(con):
         return render_template(
             "index.html",
             parquet_path=parquet_path,
@@ -351,9 +335,10 @@ def index():
             error=f"No data found at {parquet_path}. Run the pipeline first.",
         )
 
-    years = _available_years(df)
-    categories = _category_options(df)
-    values = _value_options(df)
+    columns = _get_columns(con)
+    years = _available_years(con)
+    categories = _category_options(con)
+    values = _value_options(con)
 
     # Defaults
     year = request.args.get("year") or (str(years[-1]) if years else "all")
@@ -369,69 +354,88 @@ def index():
         limit = "50"
 
     value_locked = False
-    if "raun" in df.columns:
+    if "raun" in columns:
         value = "raun"
         value_locked = True
     elif value not in values and value != "none":
         value = values[0] if values else "none"
 
-    filtered = _apply_filters(df, year, category, value, filter_value)
+    where_sql, where_params = _build_where(year, category, filter_value)
 
     # Summary tables
     summary_rows = []
     metric_key = None
     metric_label = None
     metric_display_key = None
-    if category and category != "none" and category in filtered.columns:
-        if not value or value == "none" or value not in filtered.columns or value == category:
-            summary = (
-                filtered.groupby(category, dropna=False)
-                .size()
-                .reset_index(name="count")
-                .sort_values("count", ascending=False)
-            )
-            metric_key = "count"
-            metric_label = "count"
-        else:
-            summary = (
-                filtered.groupby(category, dropna=False)[value]
-                .sum(min_count=1)
-                .reset_index()
-                .sort_values(value, ascending=False)
-            )
-            metric_key = value
-            metric_label = value
-        summary_rows = summary.head(50).to_dict(orient="records")
-        if metric_key == "raun":
-            for row in summary_rows:
-                row["_metric_display"] = _format_number(row.get(metric_key))
-            metric_display_key = "_metric_display"
+    if category and category != "none" and category in columns:
+        metric_key = "raun"
+        metric_label = "raun"
+        numeric_expr = _numeric_expr("raun")
+        summary_query = f"""
+            SELECT {category}, SUM({numeric_expr}) AS raun
+            FROM arsuppgjor
+            {where_sql}
+            GROUP BY {category}
+            ORDER BY raun DESC NULLS LAST
+            LIMIT 50
+        """.strip()
+        summary_df = con.execute(summary_query, where_params).fetchdf()
+        summary_rows = summary_df.to_dict(orient="records")
+        for row in summary_rows:
+            row["_metric_display"] = _format_number(row.get("raun"))
+        metric_display_key = "_metric_display"
 
-    totals = {"rows": int(filtered.shape[0])}
+    totals = {"rows": 0}
     totals_display_sum = None
     totals_display_pos = None
     totals_display_neg = None
-    if value and value != "none" and value in filtered.columns and value != category:
-        numeric_series = pd.to_numeric(filtered[value], errors="coerce")
-        totals["sum"] = float(numeric_series.sum(skipna=True))
-        totals["sum_pos"] = float(numeric_series[numeric_series > 0].sum(skipna=True))
-        totals["sum_neg"] = float(numeric_series[numeric_series < 0].sum(skipna=True))
+    if value and value != "none" and value in columns and value != category:
+        numeric_expr = _numeric_expr(value)
+        totals_query = f"""
+            SELECT
+                COUNT(*) AS rows,
+                SUM({numeric_expr}) AS sum,
+                SUM(CASE WHEN {numeric_expr} > 0 THEN {numeric_expr} END) AS sum_pos,
+                SUM(CASE WHEN {numeric_expr} < 0 THEN {numeric_expr} END) AS sum_neg
+            FROM arsuppgjor
+            {where_sql}
+        """.strip()
+        totals_row = con.execute(totals_query, where_params).fetchone()
+        totals["rows"] = int(totals_row[0] or 0)
+        totals["sum"] = float(totals_row[1] or 0)
+        totals["sum_pos"] = float(totals_row[2] or 0)
+        totals["sum_neg"] = float(totals_row[3] or 0)
         metric_label = metric_label or value
         if value == "raun":
             totals_display_sum = _format_number(totals["sum"])
             totals_display_pos = _format_number(totals["sum_pos"])
             totals_display_neg = _format_number(totals["sum_neg"])
 
-    filter_values = _top_filter_values(filtered, category, limit=50)
+    filter_values = []
+    if category and category != "none" and category in columns:
+        filter_query = f"""
+            SELECT {category}, COUNT(*) AS count
+            FROM arsuppgjor
+            {where_sql}
+            GROUP BY {category}
+            ORDER BY count DESC
+            LIMIT 50
+        """.strip()
+        filter_values = con.execute(filter_query, where_params).fetchall()
 
     preview_columns = _select_preview_columns(
-        filtered.columns,
+        columns,
         category,
         value,
         values,
         limit=12,
     )
-    preview_rows = filtered.head(limit_int)[preview_columns].to_dict(orient="records")
+    if preview_columns:
+        cols_sql = ", ".join(preview_columns)
+        preview_query = f"SELECT {cols_sql} FROM arsuppgjor {where_sql} LIMIT ?"
+        preview_rows = con.execute(preview_query, [*where_params, limit_int]).fetchdf().to_dict(orient="records")
+    else:
+        preview_rows = []
     preview_rows = _format_preview_rows(preview_rows, preview_columns)
 
     base_params = {
@@ -502,15 +506,9 @@ def index():
 
 @app.route("/reload")
 def reload_data():
-    load_data.cache_clear()
+    get_connection.cache_clear()
     return redirect(url_for("index"))
 
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
-    if category not in categories and category != "none":
-        category = categories[0] if categories else "none"
-    if "raun" in df.columns:
-        value = "raun"
-    elif value not in values and value != "none":
-        value = values[0] if values else "none"
