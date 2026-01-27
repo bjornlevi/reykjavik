@@ -50,6 +50,7 @@ DISPLAY_NAMES = {
     "tegund3": "Item",
     "fyrirtaeki": "Entity",
     "vm_numer": "VSK number",
+    "vm_nafn": "VSK name",
     "raun": "Actual",
 }
 CLICKABLE_COLUMNS = {
@@ -62,6 +63,8 @@ CLICKABLE_COLUMNS = {
     "tegund1",
     "tegund2",
     "tegund3",
+    "vm_numer",
+    "vm_nafn",
 }
 
 
