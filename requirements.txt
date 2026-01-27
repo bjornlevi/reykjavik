@@ -1,0 +1,5 @@
+requests>=2.31.0
+pandas>=2.1.0
+pyarrow>=14.0.0
+flask>=3.0.0
+beautifulsoup4>=4.12.0
