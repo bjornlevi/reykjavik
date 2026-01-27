@@ -149,7 +149,12 @@ def load_data(parquet_path: str) -> pd.DataFrame:
     path = Path(parquet_path)
     if not path.exists():
         return pd.DataFrame()
-    return pd.read_parquet(path, dtype_backend="numpy_nullable")
+    df = pd.read_parquet(path, dtype_backend="numpy_nullable")
+    # Force object dtype for string-like columns to avoid pyarrow string ops in filters.
+    for col in df.columns:
+        if pd.api.types.is_string_dtype(df[col]) or df[col].dtype == object:
+            df[col] = df[col].astype(object)
+    return df
 
 
 def _available_years(df: pd.DataFrame) -> list[int]:
@@ -174,7 +179,9 @@ def _apply_filters(
             filtered = filtered[year_series == year_value]
     if category and category != "none" and filter_value and filter_value != "all":
         if category in filtered.columns:
-            filtered = filtered[filtered[category].astype(str) == filter_value]
+            series = filtered[category].astype(object).fillna("")
+            mask = series == filter_value
+            filtered = filtered.loc[mask]
     if value and value in filtered.columns:
         # Coerce to numeric for aggregation
         filtered = filtered.copy()
