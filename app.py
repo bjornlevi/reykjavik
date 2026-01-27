@@ -149,7 +149,7 @@ def load_data(parquet_path: str) -> pd.DataFrame:
     path = Path(parquet_path)
     if not path.exists():
         return pd.DataFrame()
-    return pd.read_parquet(path)
+    return pd.read_parquet(path, dtype_backend="numpy_nullable")
 
 
 def _available_years(df: pd.DataFrame) -> list[int]:
@@ -168,7 +168,10 @@ def _apply_filters(
 ) -> pd.DataFrame:
     filtered = df
     if year and year != "all" and "year" in filtered.columns:
-        filtered = filtered[filtered["year"].astype(str) == year]
+        year_value = pd.to_numeric(year, errors="coerce")
+        if pd.notna(year_value):
+            year_series = pd.to_numeric(filtered["year"], errors="coerce")
+            filtered = filtered[year_series == year_value]
     if category and category != "none" and filter_value and filter_value != "all":
         if category in filtered.columns:
             filtered = filtered[filtered[category].astype(str) == filter_value]
@@ -412,20 +415,7 @@ def index():
             totals_display_pos = _format_number(totals["sum_pos"])
             totals_display_neg = _format_number(totals["sum_neg"])
 
-    if year != "all" and "year" in df.columns:
-        try:
-            year_series = pd.to_numeric(df["year"], errors="coerce")
-            year_value = pd.to_numeric([year], errors="coerce")[0]
-            if pd.isna(year_value):
-                year_filtered = df
-            else:
-                mask = year_series == year_value
-                year_filtered = df.loc[mask]
-        except Exception:
-            year_filtered = df
-    else:
-        year_filtered = df
-    filter_values = _top_filter_values(year_filtered, category, limit=50)
+    filter_values = _top_filter_values(filtered, category, limit=50)
 
     preview_columns = _select_preview_columns(
         filtered.columns,
