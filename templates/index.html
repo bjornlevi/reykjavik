@@ -212,7 +212,7 @@
             </div>
           {% endif %}
 
-          <form method="get" action="/" class="row-count">
+          <form method="get" action="{{ url_for('index') }}" class="row-count">
             <input type="hidden" name="year" value="{{ year }}" />
             <input type="hidden" name="category" value="{{ category }}" />
             <input type="hidden" name="value" value="{{ value }}" />
@@ -227,7 +227,7 @@
           </form>
         {% endif %}
         <div class="footer">
-          <a href="/reload">Reload data</a>
+          <a href="{{ url_for('reload_data') }}">Reload data</a>
         </div>
       </div>
 
