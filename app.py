@@ -414,8 +414,13 @@ def index():
 
     if year != "all" and "year" in df.columns:
         try:
-            mask = df["year"].astype(str).to_numpy() == year
-            year_filtered = df.loc[mask]
+            year_series = pd.to_numeric(df["year"], errors="coerce")
+            year_value = pd.to_numeric([year], errors="coerce")[0]
+            if pd.isna(year_value):
+                year_filtered = df
+            else:
+                mask = year_series == year_value
+                year_filtered = df.loc[mask]
         except Exception:
             year_filtered = df
     else:
