@@ -66,6 +66,19 @@ CLICKABLE_COLUMNS = {
     "vm_numer",
     "vm_nafn",
 }
+FILTER_COLUMNS = [
+    "fyrirtaeki",
+    "samtala0",
+    "samtala1",
+    "samtala2",
+    "samtala3",
+    "tegund0",
+    "tegund1",
+    "tegund2",
+    "tegund3",
+    "vm_numer",
+    "vm_nafn",
+]
 
 
 def _display_name(col: str) -> str:
@@ -166,7 +179,8 @@ def get_connection(parquet_path: str) -> duckdb.DuckDBPyConnection:
     if not path.exists():
         return con
     con.execute("PRAGMA threads=4")
-    con.execute(f"CREATE OR REPLACE VIEW arsuppgjor AS SELECT * FROM read_parquet('{str(path)}')")
+    safe_path = str(path).replace("'", "''")
+    con.execute(f"CREATE OR REPLACE VIEW arsuppgjor AS SELECT * FROM read_parquet('{safe_path}')")
     return con
 
 
@@ -188,7 +202,7 @@ def _available_years(con: duckdb.DuckDBPyConnection) -> list[int]:
         return []
 
 
-def _build_where(year: str, category: str, filter_value: str) -> tuple[str, list]:
+def _build_where(year: str, filters: dict[str, str], exclude_col: str | None = None) -> tuple[str, list]:
     clauses = []
     params: list = []
     if year and year != "all":
@@ -198,9 +212,11 @@ def _build_where(year: str, category: str, filter_value: str) -> tuple[str, list
             params.append(year_value)
         except ValueError:
             pass
-    if category and category != "none" and filter_value and filter_value != "all":
-        clauses.append(f"{category} = ?")
-        params.append(filter_value)
+    for col, value in filters.items():
+        if exclude_col and col == exclude_col:
+            continue
+        clauses.append(f"{col} = ?")
+        params.append(value)
     where_sql = " AND ".join(clauses)
     if where_sql:
         where_sql = "WHERE " + where_sql
@@ -215,6 +231,20 @@ def _value_options(con: duckdb.DuckDBPyConnection) -> list[str]:
 def _category_options(con: duckdb.DuckDBPyConnection) -> list[str]:
     candidates = _category_candidates(con)
     return sorted(candidates)
+
+
+def _distinct_values(
+    con: duckdb.DuckDBPyConnection,
+    column: str,
+    where_sql: str,
+    params: list,
+    limit: int = 200,
+) -> list[str]:
+    if where_sql:
+        query = f"SELECT DISTINCT {column} FROM arsuppgjor {where_sql} AND {column} IS NOT NULL ORDER BY {column} LIMIT {limit}"
+    else:
+        query = f"SELECT DISTINCT {column} FROM arsuppgjor WHERE {column} IS NOT NULL ORDER BY {column} LIMIT {limit}"
+    return [row[0] for row in con.execute(query, params).fetchall()]
 
 
 def _select_preview_columns(
@@ -330,6 +360,12 @@ def _build_links(
     return links
 
 
+def _build_filter_url(col: str, value: str, base_params: dict) -> str:
+    params = dict(base_params)
+    params[f"f_{col}"] = value
+    return url_for("index", **params)
+
+
 @app.route("/")
 def index():
     parquet_path = DEFAULT_PARQUET
@@ -367,7 +403,15 @@ def index():
     elif value not in values and value != "none":
         value = values[0] if values else "none"
 
-    where_sql, where_params = _build_where(year, category, filter_value)
+    filters: dict[str, str] = {}
+    for col in FILTER_COLUMNS:
+        val = request.args.get(f"f_{col}") or "all"
+        if val != "all":
+            filters[col] = val
+    if category and category != "none" and filter_value != "all" and category in FILTER_COLUMNS and category not in filters:
+        filters[category] = filter_value
+
+    where_sql, where_params = _build_where(year, filters)
 
     # Summary tables
     summary_rows = []
@@ -430,6 +474,13 @@ def index():
         """.strip()
         filter_values = con.execute(filter_query, where_params).fetchall()
 
+    filter_options: dict[str, list[str]] = {}
+    for col in FILTER_COLUMNS:
+        if col not in columns:
+            continue
+        col_where, col_params = _build_where(year, filters, exclude_col=col)
+        filter_options[col] = _distinct_values(con, col, col_where, col_params, limit=200)
+
     preview_columns = _select_preview_columns(
         columns,
         category,
@@ -452,6 +503,8 @@ def index():
         "filter_value": filter_value,
         "limit": limit,
     }
+    for col in FILTER_COLUMNS:
+        base_params[f"f_{col}"] = filters.get(col, "all")
     year_links = _build_links(["all"] + [str(y) for y in years], year, "year", base_params, label_fn=lambda x: "All" if x == "all" else x)
     category_links = _build_links(
         ["none"] + categories,
@@ -475,6 +528,8 @@ def index():
         label = f"{v} ({count})"
         params = dict(base_params)
         params["filter_value"] = v
+        if category in FILTER_COLUMNS:
+            params[f"f_{category}"] = v
         filter_value_links.append({
             "label": label,
             "value": v,
@@ -508,6 +563,11 @@ def index():
         value_locked=value_locked,
         display_name=_display_name,
         clickable_columns=CLICKABLE_COLUMNS,
+        filter_columns=FILTER_COLUMNS,
+        filter_options=filter_options,
+        filters=filters,
+        base_params=base_params,
+        build_filter_url=_build_filter_url,
     )
 
 

@@ -203,6 +203,25 @@
             </div>
           {% endif %}
 
+          <div class="section-title">Filters</div>
+          <form method="get" action="{{ url_for('index') }}">
+            <input type="hidden" name="year" value="{{ year }}" />
+            <input type="hidden" name="category" value="{{ category }}" />
+            <input type="hidden" name="value" value="{{ value }}" />
+            <input type="hidden" name="filter_value" value="{{ filter_value }}" />
+            <input type="hidden" name="limit" value="{{ limit }}" />
+            {% for col in filter_columns %}
+              <label for="f_{{ col }}">{{ display_name(col) }}</label>
+              <select id="f_{{ col }}" name="f_{{ col }}">
+                <option value="all" {% if filters.get(col) == "all" or not filters.get(col) %}selected{% endif %}>All</option>
+                {% for option in filter_options.get(col, []) %}
+                  <option value="{{ option }}" {% if filters.get(col) == option %}selected{% endif %}>{{ option }}</option>
+                {% endfor %}
+              </select>
+            {% endfor %}
+            <button type="submit">Apply filters</button>
+          </form>
+
           {% if not value_locked %}
             <div class="section-title">Amount columns</div>
             <div class="pill-grid">
@@ -217,6 +236,9 @@
             <input type="hidden" name="category" value="{{ category }}" />
             <input type="hidden" name="value" value="{{ value }}" />
             <input type="hidden" name="filter_value" value="{{ filter_value }}" />
+            {% for col in filter_columns %}
+              <input type="hidden" name="f_{{ col }}" value="{{ filters.get(col, 'all') }}" />
+            {% endfor %}
             <input type="number" min="1" max="500" name="limit" value="{{ limit }}" />
             <button type="submit">Rows</button>
           </form>
@@ -315,7 +337,7 @@
                       <td class="{% if col == 'raun' %}num{% endif %}">
                         {% if col in clickable_columns %}
                           {% if row[col] %}
-                            <a href="{{ url_for('index', year=year, category=col, filter_value=row[col], value=value, limit=limit) }}">{{ row[col] }}</a>
+                            <a href="{{ build_filter_url(col, row[col], base_params) }}">{{ row[col] }}</a>
                           {% else %}
                             {{ row[col] }}
                           {% endif %}
