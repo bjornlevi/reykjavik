@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import os
+import json
+import math
 from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
 import duckdb
 import pandas as pd
-from flask import Flask, redirect, render_template, request, url_for
+from flask import Flask, Response, redirect, render_template, request, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 DEFAULT_PARQUET = os.getenv("PARQUET_PATH", "data/processed/arsuppgjor_combined.parquet")
@@ -78,6 +80,19 @@ FILTER_COLUMNS = [
     "tegund3",
     "vm_numer",
     "vm_nafn",
+]
+ANALYSIS_PARENT_COLUMNS = {
+    "group": "tegund0",
+    "vsk_name": "vm_nafn",
+}
+ANALYSIS_CHILD_COLUMNS = [
+    "samtala0",
+    "samtala1",
+    "samtala2",
+    "samtala3",
+    "tegund1",
+    "tegund2",
+    "tegund3",
 ]
 
 
@@ -247,6 +262,11 @@ def _distinct_values(
     return [row[0] for row in con.execute(query, params).fetchall()]
 
 
+def _distinct_non_null(con: duckdb.DuckDBPyConnection, column: str, limit: int = 1000) -> list[str]:
+    query = f"SELECT DISTINCT {column} FROM arsuppgjor WHERE {column} IS NOT NULL ORDER BY {column} LIMIT {limit}"
+    return [row[0] for row in con.execute(query).fetchall()]
+
+
 def _select_preview_columns(
     columns: Iterable[str],
     category: str | None,
@@ -364,6 +384,36 @@ def _build_filter_url(col: str, value: str, base_params: dict) -> str:
     params = dict(base_params)
     params[f"f_{col}"] = value
     return url_for("index", **params)
+
+
+def _analysis_url(base: dict, **updates) -> str:
+    params = dict(base)
+    params.update(updates)
+    return url_for("analysis", **params)
+
+
+def _analysis_scope_from_request(
+    con: duckdb.DuckDBPyConnection,
+) -> tuple[str, str, str, str, str, list[str], list[str], str]:
+    parent_type = request.args.get("parent_type", "group")
+    if parent_type not in ANALYSIS_PARENT_COLUMNS:
+        parent_type = "group"
+    parent_col = ANALYSIS_PARENT_COLUMNS[parent_type]
+
+    columns = _get_columns(con)
+    child_keys = [c for c in ANALYSIS_CHILD_COLUMNS if c in columns]
+    child_key = request.args.get("child_key") or (child_keys[0] if child_keys else "")
+    if child_key not in child_keys:
+        child_key = child_keys[0] if child_keys else ""
+
+    parent_options = _distinct_non_null(con, parent_col, limit=1500) if parent_col in columns else []
+    parent_value = request.args.get("parent_value") or (parent_options[0] if parent_options else "")
+    if parent_value and parent_value not in parent_options:
+        parent_value = parent_options[0] if parent_options else ""
+
+    child_value = request.args.get("child_value", "")
+    analysis_year = request.args.get("analysis_year", "all")
+    return parent_type, parent_col, child_key, parent_value, child_value, child_keys, parent_options, analysis_year
 
 
 @app.route("/")
@@ -568,6 +618,222 @@ def index():
         filters=filters,
         base_params=base_params,
         build_filter_url=_build_filter_url,
+    )
+
+
+@app.route("/analysis")
+def analysis():
+    parquet_path = DEFAULT_PARQUET
+    con = get_connection(parquet_path)
+    if not _table_exists(con):
+        return render_template(
+            "analysis.html",
+            data_loaded=False,
+            error=f"No data found at {parquet_path}. Run the pipeline first.",
+        )
+
+    (
+        parent_type,
+        parent_col,
+        child_key,
+        parent_value,
+        child_value,
+        child_keys,
+        parent_options,
+        analysis_year,
+    ) = _analysis_scope_from_request(con)
+    columns = _get_columns(con)
+
+    try:
+        page = max(1, int(request.args.get("page", "1")))
+    except ValueError:
+        page = 1
+    try:
+        page_size = int(request.args.get("page_size", "100"))
+    except ValueError:
+        page_size = 100
+    page_size = max(25, min(500, page_size))
+
+    base_params = {
+        "parent_type": parent_type,
+        "parent_value": parent_value,
+        "child_key": child_key,
+        "child_value": child_value,
+        "analysis_year": analysis_year,
+        "page": page,
+        "page_size": page_size,
+    }
+
+    if not parent_value or not child_key:
+        return render_template(
+            "analysis.html",
+            data_loaded=True,
+            parent_type=parent_type,
+            parent_col=parent_col,
+            child_key=child_key,
+            parent_options=parent_options,
+            child_keys=child_keys,
+            parent_value=parent_value,
+            child_value=child_value,
+            analysis_year=analysis_year,
+            parent_label=_display_name(parent_col),
+            child_label=_display_name(child_key) if child_key else "",
+            breakdown_rows=[],
+            record_rows=[],
+            record_columns=[],
+            yearly_labels=[],
+            yearly_values=[],
+            year_links=[],
+            chart_title="",
+            page=page,
+            page_size=page_size,
+            total_records=0,
+            total_pages=1,
+            build_analysis_url=_analysis_url,
+            base_params=base_params,
+            display_name=_display_name,
+        )
+
+    numeric_expr = _numeric_expr("raun")
+
+    scope_params = [parent_value]
+    scope_where = f"{parent_col} = ?"
+    if child_value:
+        scope_where += f" AND {child_key} = ?"
+        scope_params.append(child_value)
+
+    graph_query = f"""
+        SELECT year, SUM({numeric_expr}) AS actual_sum
+        FROM arsuppgjor
+        WHERE {scope_where} AND year IS NOT NULL
+        GROUP BY year
+        ORDER BY year
+    """.strip()
+    graph_rows = con.execute(graph_query, scope_params).fetchall()
+    yearly_labels = [str(int(row[0])) for row in graph_rows]
+    yearly_values = [float(row[1] or 0) for row in graph_rows]
+    if analysis_year != "all" and analysis_year not in yearly_labels:
+        analysis_year = "all"
+    base_params["analysis_year"] = analysis_year
+
+    table_where = scope_where
+    table_params = list(scope_params)
+    if analysis_year != "all":
+        table_where += " AND year = ?"
+        table_params.append(int(analysis_year))
+
+    record_columns = [c for c in ["year", parent_col, child_key, "samtala2", "samtala3", "tegund1", "tegund2", "tegund3", "vm_nafn", "vm_numer", "raun"] if c in columns]
+    breakdown_query = f"""
+        SELECT {child_key} AS child_value, SUM({numeric_expr}) AS actual_sum, COUNT(*) AS row_count
+        FROM arsuppgjor
+        WHERE {table_where} AND {child_key} IS NOT NULL
+        GROUP BY {child_key}
+        ORDER BY ABS(actual_sum) DESC NULLS LAST
+        LIMIT 500
+    """.strip()
+    breakdown_df = con.execute(breakdown_query, table_params).fetchdf()
+    breakdown_rows = breakdown_df.to_dict(orient="records")
+    for row in breakdown_rows:
+        row["actual_sum_fmt"] = _format_number(row.get("actual_sum"))
+
+    if record_columns:
+        count_query = f"SELECT COUNT(*) FROM arsuppgjor WHERE {table_where}"
+        total_records = int(con.execute(count_query, table_params).fetchone()[0] or 0)
+        total_pages = max(1, int(math.ceil(total_records / page_size)))
+        if page > total_pages:
+            page = total_pages
+            base_params["page"] = page
+        offset = (page - 1) * page_size
+
+        records_query = f"""
+            SELECT {", ".join(record_columns)}
+            FROM arsuppgjor
+            WHERE {table_where}
+            ORDER BY year DESC
+            LIMIT ?
+            OFFSET ?
+        """.strip()
+        record_rows = con.execute(records_query, [*table_params, page_size, offset]).fetchdf().to_dict(orient="records")
+    else:
+        total_records = 0
+        total_pages = 1
+        record_rows = []
+    record_rows = _format_preview_rows(record_rows, record_columns)
+
+    chart_title = f"{_display_name(parent_col)}: {parent_value}"
+    if child_value:
+        chart_title += f" | {_display_name(child_key)}: {child_value}"
+
+    return render_template(
+        "analysis.html",
+        data_loaded=True,
+        parent_type=parent_type,
+        parent_col=parent_col,
+        child_key=child_key,
+        parent_options=parent_options,
+        child_keys=child_keys,
+        parent_value=parent_value,
+        child_value=child_value,
+        analysis_year=analysis_year,
+        parent_label=_display_name(parent_col),
+        child_label=_display_name(child_key),
+        breakdown_rows=breakdown_rows,
+        record_rows=record_rows,
+        record_columns=record_columns,
+        yearly_labels=yearly_labels,
+        yearly_values=yearly_values,
+        yearly_labels_json=json.dumps(yearly_labels),
+        yearly_values_json=json.dumps(yearly_values),
+        year_links=["all"] + yearly_labels,
+        chart_title=chart_title,
+        page=page,
+        page_size=page_size,
+        total_records=total_records,
+        total_pages=total_pages,
+        build_analysis_url=_analysis_url,
+        base_params=base_params,
+        display_name=_display_name,
+    )
+
+
+@app.route("/analysis/export")
+def analysis_export():
+    parquet_path = DEFAULT_PARQUET
+    con = get_connection(parquet_path)
+    if not _table_exists(con):
+        return Response("No data available", status=404)
+
+    (
+        _parent_type,
+        parent_col,
+        child_key,
+        parent_value,
+        child_value,
+        _child_keys,
+        _parent_options,
+        analysis_year,
+    ) = _analysis_scope_from_request(con)
+    columns = _get_columns(con)
+    if not parent_value or not child_key:
+        return Response("Missing selection", status=400)
+
+    scope_params = [parent_value]
+    scope_where = f"{parent_col} = ?"
+    if child_value:
+        scope_where += f" AND {child_key} = ?"
+        scope_params.append(child_value)
+    if analysis_year != "all":
+        scope_where += " AND year = ?"
+        scope_params.append(int(analysis_year))
+
+    export_columns = [c for c in ["year", parent_col, child_key, "samtala0", "samtala1", "samtala2", "samtala3", "tegund0", "tegund1", "tegund2", "tegund3", "vm_nafn", "vm_numer", "raun"] if c in columns]
+    query = f"SELECT {', '.join(export_columns)} FROM arsuppgjor WHERE {scope_where} ORDER BY year DESC"
+    csv_text = con.execute(query, scope_params).fetchdf().to_csv(index=False)
+    filename = f"analysis_{parent_col}.csv"
+    return Response(
+        csv_text,
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
 
 
