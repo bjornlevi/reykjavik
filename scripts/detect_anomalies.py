@@ -41,6 +41,10 @@ class Config:
     timeout: int
 
 
+def _log(message: str) -> None:
+    print(f"[anomalies] {message}", flush=True)
+
+
 def _parse_icelandic_number(value) -> float | None:
     if value is None:
         return None
@@ -108,11 +112,13 @@ def _cpi_payload(month_values: list[str]) -> dict:
 
 
 def _fetch_cpi_monthly(start_year: int, end_year: int, api_url: str, timeout: int) -> pd.DataFrame:
+    _log(f"Loading CPI metadata from {api_url}")
     requested = set(_month_values(start_year, end_year))
     available = _fetch_available_month_values(api_url, timeout)
     selected = [m for m in available if m in requested]
     if not selected:
         raise RuntimeError("No overlapping CPI months found for requested years.")
+    _log(f"Requesting CPI for {len(selected)} months ({selected[0]} to {selected[-1]})")
     payload = _cpi_payload(selected)
     response = requests.post(api_url, json=payload, timeout=timeout)
     response.raise_for_status()
@@ -135,10 +141,12 @@ def _fetch_cpi_monthly(start_year: int, end_year: int, api_url: str, timeout: in
     cpi_df = pd.DataFrame(rows)
     if cpi_df.empty:
         raise RuntimeError("CPI API returned no usable rows.")
+    _log(f"CPI monthly rows loaded: {len(cpi_df)}")
     return cpi_df.sort_values(["year", "month"]).reset_index(drop=True)
 
 
 def _load_actuals(parquet_path: Path, keys: Iterable[str]) -> pd.DataFrame:
+    _log(f"Reading source parquet: {parquet_path}")
     base_cols = ["year", "raun"]
     df = pd.read_parquet(parquet_path)
 
@@ -156,6 +164,7 @@ def _load_actuals(parquet_path: Path, keys: Iterable[str]) -> pd.DataFrame:
         df[col] = df[col].fillna("(missing)").astype(str)
 
     agg = df.groupby(["year", *available_keys], dropna=False, as_index=False)["actual_nominal"].sum()
+    _log(f"Aggregated annual nominal rows: {len(agg)}")
     return agg
 
 
@@ -219,26 +228,35 @@ def run(cfg: Config) -> int:
         print(f"Missing parquet: {cfg.parquet}")
         return 1
 
+    _log("Starting anomaly detection")
     df0 = pd.read_parquet(cfg.parquet, columns=["year"])
     year_min = int(pd.to_numeric(df0["year"], errors="coerce").dropna().min())
     year_max = int(pd.to_numeric(df0["year"], errors="coerce").dropna().max())
     cpi_end_year = max(year_max, date.today().year)
+    _log(f"Data year range: {year_min}-{year_max}")
 
     cpi_monthly = _fetch_cpi_monthly(year_min, cpi_end_year, cfg.cpi_api_url, cfg.timeout)
     cpi_annual = _annual_cpi(cpi_monthly)
+    _log(f"CPI annual rows loaded: {len(cpi_annual)}")
 
     annual_nominal = _load_actuals(cfg.parquet, DEFAULT_KEY_COLUMNS)
     key_cols = [c for c in DEFAULT_KEY_COLUMNS if c in annual_nominal.columns]
+    _log(f"Series key columns in use: {', '.join(key_cols)}")
 
+    _log("Applying CPI deflator and computing real amounts")
     merged = annual_nominal.merge(cpi_annual[["year", "deflator_to_latest"]], on="year", how="left")
     merged = merged.dropna(subset=["deflator_to_latest"]).copy()
     merged["actual_real"] = merged["actual_nominal"] * merged["deflator_to_latest"]
+    _log(f"Rows after CPI merge: {len(merged)}")
 
+    _log("Scoring anomalies")
     anomalies = _compute_anomalies(merged, key_cols, cfg)
     flagged = anomalies[anomalies["is_anomaly"]].copy()
     flagged = flagged.sort_values(["anomaly_score", "abs_change_real"], ascending=False)
+    _log(f"Flagged anomalies: {len(flagged)} of {len(anomalies)} rows")
 
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    _log(f"Writing outputs to {cfg.out_dir}")
 
     cpi_monthly.to_csv(cfg.out_dir / "cpi_monthly.csv", index=False)
     cpi_annual.to_csv(cfg.out_dir / "cpi_annual.csv", index=False)
@@ -261,8 +279,8 @@ def run(cfg: Config) -> int:
     }
     (cfg.out_dir / "anomalies_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=True))
 
-    print(f"Wrote anomaly outputs to {cfg.out_dir}")
-    print(f"Flagged rows: {len(flagged)} / {len(anomalies)}")
+    _log(f"Wrote anomaly outputs to {cfg.out_dir}")
+    _log(f"Done. Flagged rows: {len(flagged)} / {len(anomalies)}")
     return 0
 
 
