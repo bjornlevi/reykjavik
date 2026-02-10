@@ -4,7 +4,7 @@ PY ?= python
 RAW_DIR ?= data/raw
 PROCESSED_DIR ?= data/processed
 
-.PHONY: pipeline download prepare lookup clean serve
+.PHONY: pipeline download prepare lookup anomalies clean serve
 
 pipeline: download prepare lookup
 
@@ -25,6 +25,9 @@ prepare: $(PROCESSED_DIR)
 
 lookup: $(PROCESSED_DIR)
 	$(PY) scripts/lookup_vm_entities.py --parquet $(PROCESSED_DIR)/arsuppgjor_combined.parquet
+
+anomalies: $(PROCESSED_DIR)
+	$(PY) scripts/detect_anomalies.py --parquet $(PROCESSED_DIR)/arsuppgjor_combined.parquet --out-dir $(PROCESSED_DIR)
 
 serve:
 	$(PY) app.py

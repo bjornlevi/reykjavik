@@ -19,8 +19,36 @@
         font-family: "IBM Plex Sans", "Source Sans 3", "Segoe UI", sans-serif;
         background: var(--bg);
         color: var(--ink);
+        padding-top: 64px;
       }
-      header {
+      .site-header {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 64px;
+        background: var(--panel);
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 24px;
+        z-index: 1000;
+      }
+      .site-header .brand {
+        font-size: 16px;
+        font-weight: 700;
+      }
+      .site-header nav {
+        display: flex;
+        gap: 14px;
+      }
+      .site-header a {
+        color: var(--accent);
+        text-decoration: none;
+        font-size: 14px;
+      }
+      .page-header {
         padding: 24px 24px 8px;
       }
       h1 {
@@ -92,6 +120,7 @@
         text-transform: uppercase;
         letter-spacing: 0.08em;
         color: var(--muted);
+        cursor: pointer;
       }
       td.num, th.num {
         text-align: right;
@@ -168,15 +197,21 @@
     </style>
   </head>
   <body>
-    <header>
+    <header class="site-header">
+      <div class="brand">Reykjavik Accounts</div>
+      <nav>
+        <a href="{{ url_for('index') }}">Explorer</a>
+        <a href="{{ url_for('analysis') }}">Analysis</a>
+        <a href="{{ url_for('anomalies') }}">Anomalies</a>
+      </nav>
+    </header>
+    <div class="page-header">
       <h1>Analysis</h1>
       <p>Drill into a parent and see where Actual comes from.</p>
       <div class="links">
-        <a href="{{ url_for('index') }}">Back to Explorer</a>
-        <span>|</span>
         <a href="{{ url_for('analysis_export', parent_type=parent_type, parent_value=parent_value, child_key=child_key, child_value=child_value, analysis_year=analysis_year) }}">Download CSV</a>
       </div>
-    </header>
+    </div>
     <div class="container">
       <div class="panel">
         {% if data_loaded %}
@@ -345,5 +380,46 @@
         });
       </script>
     {% endif %}
+    <script>
+      (function () {
+        const parseValue = (text) => {
+          const t = (text || "").trim();
+          if (!t) return { type: "text", value: "" };
+          const normalized = t.replace(/\./g, "").replace(",", ".").replace("%", "");
+          const n = Number(normalized);
+          if (!Number.isNaN(n)) return { type: "number", value: n };
+          return { type: "text", value: t.toLowerCase() };
+        };
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = table.querySelectorAll("thead th");
+          const tbody = table.querySelector("tbody");
+          if (!headers.length || !tbody) return;
+
+          headers.forEach((th, idx) => {
+            th.addEventListener("click", () => {
+              const rows = Array.from(tbody.querySelectorAll("tr"));
+              const current = th.dataset.order || "none";
+              const next = current === "asc" ? "desc" : "asc";
+              headers.forEach((h) => { h.dataset.order = "none"; });
+              th.dataset.order = next;
+
+              rows.sort((a, b) => {
+                const av = parseValue(a.children[idx]?.innerText || "");
+                const bv = parseValue(b.children[idx]?.innerText || "");
+                if (av.type === "number" && bv.type === "number") {
+                  return next === "asc" ? av.value - bv.value : bv.value - av.value;
+                }
+                if (av.value < bv.value) return next === "asc" ? -1 : 1;
+                if (av.value > bv.value) return next === "asc" ? 1 : -1;
+                return 0;
+              });
+
+              rows.forEach((row) => tbody.appendChild(row));
+            });
+          });
+        });
+      })();
+    </script>
   </body>
 </html>

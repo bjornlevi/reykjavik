@@ -15,6 +15,8 @@ from flask import Flask, Response, redirect, render_template, request, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 DEFAULT_PARQUET = os.getenv("PARQUET_PATH", "data/processed/arsuppgjor_combined.parquet")
+DEFAULT_ANOMALIES_PARQUET = os.getenv("ANOMALIES_PARQUET_PATH", "data/processed/anomalies_flagged.parquet")
+DEFAULT_ANOMALIES_ALL_PARQUET = os.getenv("ANOMALIES_ALL_PARQUET_PATH", "data/processed/anomalies_yoy_all.parquet")
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "change-me")
@@ -93,6 +95,18 @@ ANALYSIS_CHILD_COLUMNS = [
     "tegund1",
     "tegund2",
     "tegund3",
+]
+ANOMALY_PARENT_COLUMNS = [
+    "samtala0",
+    "samtala1",
+    "samtala2",
+    "samtala3",
+    "tegund0",
+    "tegund1",
+    "tegund2",
+    "tegund3",
+    "vm_nafn",
+    "vm_numer",
 ]
 
 
@@ -202,6 +216,46 @@ def get_connection(parquet_path: str) -> duckdb.DuckDBPyConnection:
 def _table_exists(con: duckdb.DuckDBPyConnection) -> bool:
     try:
         con.execute("SELECT 1 FROM arsuppgjor LIMIT 1")
+        return True
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=1)
+def get_anomaly_connection(parquet_path: str) -> duckdb.DuckDBPyConnection:
+    path = Path(parquet_path)
+    con = duckdb.connect(database=":memory:")
+    if not path.exists():
+        return con
+    con.execute("PRAGMA threads=4")
+    safe_path = str(path).replace("'", "''")
+    con.execute(f"CREATE OR REPLACE VIEW anomalies AS SELECT * FROM read_parquet('{safe_path}')")
+    return con
+
+
+def _anomaly_table_exists(con: duckdb.DuckDBPyConnection) -> bool:
+    try:
+        con.execute("SELECT 1 FROM anomalies LIMIT 1")
+        return True
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=1)
+def get_anomaly_all_connection(parquet_path: str) -> duckdb.DuckDBPyConnection:
+    path = Path(parquet_path)
+    con = duckdb.connect(database=":memory:")
+    if not path.exists():
+        return con
+    con.execute("PRAGMA threads=4")
+    safe_path = str(path).replace("'", "''")
+    con.execute(f"CREATE OR REPLACE VIEW anomalies_all AS SELECT * FROM read_parquet('{safe_path}')")
+    return con
+
+
+def _anomaly_all_table_exists(con: duckdb.DuckDBPyConnection) -> bool:
+    try:
+        con.execute("SELECT 1 FROM anomalies_all LIMIT 1")
         return True
     except Exception:
         return False
@@ -390,6 +444,12 @@ def _analysis_url(base: dict, **updates) -> str:
     params = dict(base)
     params.update(updates)
     return url_for("analysis", **params)
+
+
+def _anomalies_url(base: dict, **updates) -> str:
+    params = dict(base)
+    params.update(updates)
+    return url_for("anomalies")
 
 
 def _analysis_scope_from_request(
@@ -837,9 +897,223 @@ def analysis_export():
     )
 
 
+@app.route("/anomalies")
+def anomalies():
+    con = get_anomaly_connection(DEFAULT_ANOMALIES_PARQUET)
+    if not _anomaly_table_exists(con):
+        return render_template(
+            "anomalies.html",
+            data_loaded=False,
+            error=f"No anomalies file found at {DEFAULT_ANOMALIES_PARQUET}. Run `make anomalies` first.",
+        )
+
+    year = request.args.get("year", "all")
+    direction = request.args.get("direction", "all")
+    parent_col = request.args.get("parent_col", "tegund0")
+    if parent_col not in ANOMALY_PARENT_COLUMNS:
+        parent_col = "tegund0"
+    parent_value = request.args.get("parent_value", "all")
+
+    try:
+        page = max(1, int(request.args.get("page", "1")))
+    except ValueError:
+        page = 1
+    try:
+        page_size = int(request.args.get("page_size", "100"))
+    except ValueError:
+        page_size = 100
+    page_size = max(25, min(500, page_size))
+
+    where = []
+    params: list = []
+    if year != "all":
+        where.append("year = ?")
+        params.append(int(year))
+    if direction != "all":
+        where.append("direction = ?")
+        params.append(direction)
+    if parent_value != "all":
+        where.append(f"{parent_col} = ?")
+        params.append(parent_value)
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+
+    count_row = con.execute(f"SELECT COUNT(*) FROM anomalies {where_sql}", params).fetchone()
+    total_records = int(count_row[0] or 0)
+    total_pages = max(1, int(math.ceil(total_records / page_size)))
+    if page > total_pages:
+        page = total_pages
+    offset = (page - 1) * page_size
+
+    rows_query = f"""
+        SELECT year, direction, anomaly_score, yoy_real_pct, yoy_real_change, actual_real, prior_real,
+               samtala0, samtala1, samtala2, samtala3, tegund0, tegund1, tegund2, tegund3, vm_nafn, vm_numer
+        FROM anomalies
+        {where_sql}
+        ORDER BY anomaly_score DESC, abs_change_real DESC
+        LIMIT ?
+        OFFSET ?
+    """.strip()
+    rows_df = con.execute(rows_query, [*params, page_size, offset]).fetchdf()
+    rows = rows_df.to_dict(orient="records")
+    for row in rows:
+        row["anomaly_score"] = f"{float(row.get('anomaly_score') or 0):.2f}"
+        row["yoy_real_pct_fmt"] = f"{float(row.get('yoy_real_pct') or 0) * 100:.1f}%"
+        row["yoy_real_change_fmt"] = _format_number(row.get("yoy_real_change"))
+        row["actual_real_fmt"] = _format_number(row.get("actual_real"))
+        row["prior_real_fmt"] = _format_number(row.get("prior_real"))
+
+    def _norm_key_value(v):
+        if pd.isna(v):
+            return None
+        return str(v)
+
+    series_key_cols = [c for c in ANOMALY_PARENT_COLUMNS if c in rows_df.columns]
+    totals_map: dict[tuple, list[dict]] = {}
+    if series_key_cols and not rows_df.empty:
+        all_con = get_anomaly_all_connection(DEFAULT_ANOMALIES_ALL_PARQUET)
+        source_view = "anomalies_all" if _anomaly_all_table_exists(all_con) else "anomalies"
+        if source_view == "anomalies":
+            all_con = con
+
+        key_rows = rows_df[series_key_cols].drop_duplicates().values.tolist()
+        if key_rows:
+            row_placeholder = "(" + ", ".join(["?"] * len(series_key_cols)) + ")"
+            values_sql = ", ".join([row_placeholder] * len(key_rows))
+            key_cols_sql = ", ".join(series_key_cols)
+            join_sql = " AND ".join([f"a.{c} = k.{c}" for c in series_key_cols])
+            select_cols_sql = ", ".join([f"a.{c} AS {c}" for c in series_key_cols])
+            group_cols_sql = ", ".join([f"a.{c}" for c in series_key_cols])
+            year_totals_query = f"""
+                WITH k({key_cols_sql}) AS (
+                    VALUES {values_sql}
+                )
+                SELECT a.year, {select_cols_sql}, SUM(a.actual_real) AS actual_real_sum
+                FROM {source_view} a
+                JOIN k ON {join_sql}
+                GROUP BY a.year, {group_cols_sql}
+                ORDER BY a.year
+            """.strip()
+            flat_params = [item for key in key_rows for item in key]
+            year_totals_df = all_con.execute(year_totals_query, flat_params).fetchdf()
+            for _, r in year_totals_df.iterrows():
+                key = tuple(_norm_key_value(r[c]) for c in series_key_cols)
+                totals_map.setdefault(key, []).append(
+                    {
+                        "year": int(r["year"]),
+                        "actual_real": float(r["actual_real_sum"] or 0),
+                        "actual_real_fmt": _format_number(r["actual_real_sum"]),
+                    }
+                )
+    for row in rows:
+        key = tuple(_norm_key_value(row.get(c)) for c in series_key_cols)
+        row["year_totals"] = totals_map.get(key, [])
+
+    years = [str(int(r[0])) for r in con.execute("SELECT DISTINCT year FROM anomalies ORDER BY year").fetchall()]
+    parent_values = [r[0] for r in con.execute(f"SELECT DISTINCT {parent_col} FROM anomalies WHERE {parent_col} IS NOT NULL ORDER BY {parent_col} LIMIT 1500").fetchall()]
+
+    chart_where = []
+    chart_params: list = []
+    if direction != "all":
+        chart_where.append("direction = ?")
+        chart_params.append(direction)
+    if parent_value != "all":
+        chart_where.append(f"{parent_col} = ?")
+        chart_params.append(parent_value)
+    chart_where_sql = f"WHERE {' AND '.join(chart_where)}" if chart_where else ""
+    chart_rows = con.execute(
+        f"""
+        SELECT year, COUNT(*) AS anomalies_count, SUM(abs_change_real) AS abs_change_sum
+        FROM anomalies
+        {chart_where_sql}
+        GROUP BY year
+        ORDER BY year
+        """.strip(),
+        chart_params,
+    ).fetchall()
+    chart_labels = [str(int(r[0])) for r in chart_rows]
+    chart_counts = [int(r[1] or 0) for r in chart_rows]
+    chart_abs_change = [float(r[2] or 0) for r in chart_rows]
+
+    base_params = {
+        "year": year,
+        "direction": direction,
+        "parent_col": parent_col,
+        "parent_value": parent_value,
+        "page": page,
+        "page_size": page_size,
+    }
+    return render_template(
+        "anomalies.html",
+        data_loaded=True,
+        rows=rows,
+        years=years,
+        directions=["all", "increase", "decrease"],
+        year=year,
+        direction=direction,
+        parent_col=parent_col,
+        parent_columns=ANOMALY_PARENT_COLUMNS,
+        parent_value=parent_value,
+        parent_values=parent_values,
+        page=page,
+        page_size=page_size,
+        total_records=total_records,
+        total_pages=total_pages,
+        base_params=base_params,
+        build_anomalies_url=_anomalies_url,
+        display_name=_display_name,
+        chart_labels_json=json.dumps(chart_labels),
+        chart_counts_json=json.dumps(chart_counts),
+        chart_abs_change_json=json.dumps(chart_abs_change),
+    )
+
+
+@app.route("/anomalies/export")
+def anomalies_export():
+    con = get_anomaly_connection(DEFAULT_ANOMALIES_PARQUET)
+    if not _anomaly_table_exists(con):
+        return Response("No anomalies data available", status=404)
+
+    year = request.args.get("year", "all")
+    direction = request.args.get("direction", "all")
+    parent_col = request.args.get("parent_col", "tegund0")
+    if parent_col not in ANOMALY_PARENT_COLUMNS:
+        parent_col = "tegund0"
+    parent_value = request.args.get("parent_value", "all")
+
+    where = []
+    params: list = []
+    if year != "all":
+        where.append("year = ?")
+        params.append(int(year))
+    if direction != "all":
+        where.append("direction = ?")
+        params.append(direction)
+    if parent_value != "all":
+        where.append(f"{parent_col} = ?")
+        params.append(parent_value)
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+
+    csv_text = con.execute(
+        f"""
+        SELECT *
+        FROM anomalies
+        {where_sql}
+        ORDER BY anomaly_score DESC, abs_change_real DESC
+        """.strip(),
+        params,
+    ).fetchdf().to_csv(index=False)
+    return Response(
+        csv_text,
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=anomalies_filtered.csv"},
+    )
+
+
 @app.route("/reload")
 def reload_data():
     get_connection.cache_clear()
+    get_anomaly_connection.cache_clear()
+    get_anomaly_all_connection.cache_clear()
     return redirect(url_for("index"))
 
 

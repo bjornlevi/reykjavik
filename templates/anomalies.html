@@ -1,0 +1,456 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Anomalies</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f6f7f9;
+        --panel: #ffffff;
+        --ink: #1f2933;
+        --muted: #6b7280;
+        --accent: #2563eb;
+        --border: #e5e7eb;
+      }
+      body {
+        margin: 0;
+        font-family: "IBM Plex Sans", "Source Sans 3", "Segoe UI", sans-serif;
+        background: var(--bg);
+        color: var(--ink);
+        padding-top: 64px;
+      }
+      .site-header {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 64px;
+        background: var(--panel);
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 24px;
+        z-index: 1000;
+      }
+      .site-header .brand {
+        font-size: 16px;
+        font-weight: 700;
+      }
+      .site-header nav {
+        display: flex;
+        gap: 14px;
+      }
+      .site-header a {
+        color: var(--accent);
+        text-decoration: none;
+        font-size: 14px;
+      }
+      .page-header {
+        padding: 24px 24px 8px;
+      }
+      h1 {
+        margin: 0 0 4px;
+        font-size: 28px;
+      }
+      p {
+        margin: 0;
+        color: var(--muted);
+      }
+      .links {
+        margin-top: 8px;
+      }
+      .links a {
+        color: var(--accent);
+        text-decoration: none;
+      }
+      .links span {
+        margin: 0 6px;
+        color: var(--muted);
+      }
+      .container {
+        padding: 10px 12px 28px;
+        display: grid;
+        gap: 16px;
+        grid-template-columns: 160px 1fr;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 16px;
+        box-shadow: 0 2px 10px rgba(15, 23, 42, 0.05);
+      }
+      label {
+        display: block;
+        font-size: 13px;
+        font-weight: 600;
+        margin-bottom: 6px;
+      }
+      select, button {
+        width: 100%;
+        padding: 8px 10px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        font-size: 14px;
+        margin-bottom: 12px;
+        background: #fff;
+      }
+      button {
+        border: none;
+        background: var(--accent);
+        color: #fff;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      th, td {
+        text-align: left;
+        padding: 8px;
+        border-bottom: 1px solid var(--border);
+        font-size: 14px;
+      }
+      th {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+        cursor: pointer;
+      }
+      td.num, th.num {
+        text-align: right;
+      }
+      .table-wrap {
+        overflow-x: auto;
+      }
+      .section-title {
+        margin: 12px 0 8px;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+      }
+      .chart-wrap {
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 10px;
+      }
+      .chart {
+        width: 100%;
+        height: 240px;
+      }
+      .pager {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex-wrap: wrap;
+        margin: 10px 0;
+      }
+      .pager a {
+        display: inline-block;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 6px 10px;
+        text-decoration: none;
+        color: var(--ink);
+      }
+      .empty {
+        padding: 12px;
+        border: 1px dashed var(--border);
+        border-radius: 10px;
+        color: var(--muted);
+      }
+      tbody tr.clickable-row {
+        cursor: pointer;
+      }
+      tbody tr.clickable-row.selected {
+        background: rgba(37, 99, 235, 0.08);
+      }
+      .chevron-cell {
+        width: 24px;
+        color: var(--muted);
+      }
+      tbody tr.detail-row td {
+        background: #f8fafc;
+      }
+      @media (max-width: 1000px) {
+        .container {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="brand">Reykjavik Accounts</div>
+      <nav>
+        <a href="{{ url_for('index') }}">Explorer</a>
+        <a href="{{ url_for('analysis') }}">Analysis</a>
+        <a href="{{ url_for('anomalies') }}">Anomalies</a>
+      </nav>
+    </header>
+    <div class="page-header">
+      <h1>Anomalies</h1>
+      <p>CPI-adjusted unusual increases/decreases in Actual.</p>
+      <div class="links">
+        {% if data_loaded %}
+          <a href="{{ url_for('anomalies_export', year=year, direction=direction, parent_col=parent_col, parent_value=parent_value) }}">Download CSV</a>
+        {% endif %}
+      </div>
+    </div>
+    <div class="container">
+      <div class="panel">
+        {% if data_loaded %}
+          <form method="get" action="{{ url_for('anomalies') }}">
+            <label for="year">Year</label>
+            <select id="year" name="year">
+              <option value="all" {% if year == "all" %}selected{% endif %}>All</option>
+              {% for y in years %}
+                <option value="{{ y }}" {% if y == year %}selected{% endif %}>{{ y }}</option>
+              {% endfor %}
+            </select>
+
+            <label for="direction">Direction</label>
+            <select id="direction" name="direction">
+              {% for d in directions %}
+                <option value="{{ d }}" {% if d == direction %}selected{% endif %}>{{ d }}</option>
+              {% endfor %}
+            </select>
+
+            <label for="parent_col">Parent Key</label>
+            <select id="parent_col" name="parent_col">
+              {% for col in parent_columns %}
+                <option value="{{ col }}" {% if col == parent_col %}selected{% endif %}>{{ display_name(col) }}</option>
+              {% endfor %}
+            </select>
+
+            <label for="parent_value">Parent Value</label>
+            <select id="parent_value" name="parent_value">
+              <option value="all" {% if parent_value == "all" %}selected{% endif %}>All</option>
+              {% for val in parent_values %}
+                <option value="{{ val }}" {% if val == parent_value %}selected{% endif %}>{{ val }}</option>
+              {% endfor %}
+            </select>
+
+            <label for="page_size">Rows per page</label>
+            <select id="page_size" name="page_size">
+              <option value="50" {% if page_size == 50 %}selected{% endif %}>50</option>
+              <option value="100" {% if page_size == 100 %}selected{% endif %}>100</option>
+              <option value="250" {% if page_size == 250 %}selected{% endif %}>250</option>
+              <option value="500" {% if page_size == 500 %}selected{% endif %}>500</option>
+            </select>
+
+            <input type="hidden" name="page" value="1" />
+            <button type="submit">Apply</button>
+          </form>
+        {% else %}
+          <div class="empty">{{ error }}</div>
+        {% endif %}
+      </div>
+
+      <div class="panel">
+        {% if data_loaded %}
+          <div class="section-title">Trend</div>
+          <div class="chart-wrap">
+            <canvas id="anomalyChart" class="chart"></canvas>
+          </div>
+
+          <div class="section-title">Flagged Rows</div>
+          <p style="margin: 0 0 8px; color: var(--muted); font-size: 12px;">
+            `Prior Real` is the previous available observation in the same series (same keys), which may be earlier than calendar year - 1 if years are missing.
+          </p>
+          <div class="pager">
+            <span>{{ total_records }} rows</span>
+            <span>Page {{ page }} / {{ total_pages }}</span>
+            {% if page > 1 %}
+              <a href="{{ build_anomalies_url(base_params, page=1) }}">First</a>
+              <a href="{{ build_anomalies_url(base_params, page=page-1) }}">Previous</a>
+            {% endif %}
+            {% if page < total_pages %}
+              <a href="{{ build_anomalies_url(base_params, page=page+1) }}">Next</a>
+              <a href="{{ build_anomalies_url(base_params, page=total_pages) }}">Last</a>
+            {% endif %}
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th class="chevron-cell"></th>
+                  <th>Year</th>
+                  <th>Direction</th>
+                  <th class="num">Score</th>
+                  <th class="num">YoY %</th>
+                  <th class="num">YoY Real</th>
+                  <th>{{ display_name(parent_col) }}</th>
+                  <th>{{ display_name("samtala3") }}</th>
+                  <th>{{ display_name("tegund3") }}</th>
+                  <th>{{ display_name("vm_nafn") }}</th>
+                  <th class="num">Actual Real</th>
+                  <th class="num">Prior Real (prev obs)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for row in rows %}
+                  <tr class="clickable-row" data-row-id="{{ loop.index0 }}">
+                    <td class="chevron-cell">▸</td>
+                    <td>{{ row["year"] }}</td>
+                    <td>{{ row["direction"] }}</td>
+                    <td class="num">{{ row["anomaly_score"] }}</td>
+                    <td class="num">{{ row["yoy_real_pct_fmt"] }}</td>
+                    <td class="num">{{ row["yoy_real_change_fmt"] }}</td>
+                    <td>{{ row[parent_col] }}</td>
+                    <td>{{ row["samtala3"] }}</td>
+                    <td>{{ row["tegund3"] }}</td>
+                    <td>{{ row["vm_nafn"] }}</td>
+                    <td class="num">{{ row["actual_real_fmt"] }}</td>
+                    <td class="num">{{ row["prior_real_fmt"] }}</td>
+                  </tr>
+                  <tr class="detail-row" data-detail-id="{{ loop.index0 }}" style="display: none;">
+                    <td colspan="12">
+                      {% if row["year_totals"] %}
+                        <div class="table-wrap">
+                          <table>
+                            <thead>
+                              <tr>
+                                <th>Year totals</th>
+                                <th class="num">Actual Real</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {% for t in row["year_totals"] %}
+                                <tr>
+                                  <td>{{ t["year"] }}</td>
+                                  <td class="num">{{ t["actual_real_fmt"] }}</td>
+                                </tr>
+                              {% endfor %}
+                            </tbody>
+                          </table>
+                        </div>
+                      {% else %}
+                        No yearly totals for this row.
+                      {% endif %}
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <div class="empty">Data not loaded.</div>
+        {% endif %}
+      </div>
+    </div>
+    {% if data_loaded %}
+      <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+      <script>
+        const ctx = document.getElementById("anomalyChart");
+        new Chart(ctx, {
+          type: "bar",
+          data: {
+            labels: {{ chart_labels_json | safe }},
+            datasets: [
+              {
+                type: "bar",
+                label: "Anomaly count",
+                data: {{ chart_counts_json | safe }},
+                yAxisID: "y",
+                backgroundColor: "rgba(37, 99, 235, 0.35)",
+                borderColor: "#2563eb",
+                borderWidth: 1
+              },
+              {
+                type: "line",
+                label: "Sum abs real change",
+                data: {{ chart_abs_change_json | safe }},
+                yAxisID: "y1",
+                borderColor: "#0f766e",
+                backgroundColor: "rgba(15, 118, 110, 0.12)",
+                tension: 0.2,
+                fill: false
+              }
+            ]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+              y: { beginAtZero: true, position: "left" },
+              y1: {
+                beginAtZero: true,
+                position: "right",
+                grid: { drawOnChartArea: false },
+                ticks: { callback: (v) => Number(v).toLocaleString("is-IS") }
+              }
+            }
+          }
+        });
+      </script>
+    {% endif %}
+    <script>
+      (function () {
+        const parseValue = (text) => {
+          const t = (text || "").trim();
+          if (!t) return { type: "text", value: "" };
+          const normalized = t.replace(/\./g, "").replace(",", ".").replace("%", "");
+          const n = Number(normalized);
+          if (!Number.isNaN(n)) return { type: "number", value: n };
+          return { type: "text", value: t.toLowerCase() };
+        };
+
+        document.querySelectorAll("table").forEach((table) => {
+          const headers = table.querySelectorAll("thead th");
+          const tbody = table.querySelector("tbody");
+          if (!headers.length || !tbody) return;
+
+          headers.forEach((th, idx) => {
+            th.addEventListener("click", () => {
+              const rows = Array.from(tbody.querySelectorAll("tr"));
+              const current = th.dataset.order || "none";
+              const next = current === "asc" ? "desc" : "asc";
+              headers.forEach((h) => { h.dataset.order = "none"; });
+              th.dataset.order = next;
+
+              rows.sort((a, b) => {
+                const av = parseValue(a.children[idx]?.innerText || "");
+                const bv = parseValue(b.children[idx]?.innerText || "");
+                if (av.type === "number" && bv.type === "number") {
+                  return next === "asc" ? av.value - bv.value : bv.value - av.value;
+                }
+                if (av.value < bv.value) return next === "asc" ? -1 : 1;
+                if (av.value > bv.value) return next === "asc" ? 1 : -1;
+                return 0;
+              });
+
+              rows.forEach((row) => tbody.appendChild(row));
+            });
+          });
+        });
+      })();
+      (function () {
+        const rows = document.querySelectorAll("tr.clickable-row");
+        const details = document.querySelectorAll("tr.detail-row");
+
+        rows.forEach((row) => {
+          row.addEventListener("click", () => {
+            const id = row.dataset.rowId;
+            const detail = document.querySelector(`tr.detail-row[data-detail-id="${id}"]`);
+            const isOpen = detail && detail.style.display !== "none";
+
+            rows.forEach((r) => r.classList.remove("selected"));
+            details.forEach((d) => { d.style.display = "none"; });
+
+            if (!isOpen && detail) {
+              row.classList.add("selected");
+              detail.style.display = "table-row";
+            }
+          });
+        });
+      })();
+    </script>
+  </body>
+</html>

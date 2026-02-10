@@ -40,6 +40,29 @@ Outputs:
 - `data/processed/vm_entities.csv`
 - `data/processed/vm_entities.json` (cache)
 
+## Detect anomalies (CPI-adjusted)
+
+Detect unusual increases/decreases in `actual` (`raun`) after CPI adjustment.
+
+```bash
+python scripts/detect_anomalies.py
+```
+
+Or:
+
+```bash
+make anomalies
+```
+
+Outputs:
+- `data/processed/cpi_monthly.csv`
+- `data/processed/cpi_annual.csv`
+- `data/processed/anomalies_yoy_all.parquet`
+- `data/processed/anomalies_yoy_all.csv`
+- `data/processed/anomalies_flagged.parquet`
+- `data/processed/anomalies_flagged.csv`
+- `data/processed/anomalies_summary.json`
+
 ## Explore (Flask app)
 
 ```bash
