@@ -1013,16 +1013,18 @@ def anomalies():
 
     chart_where = []
     chart_params: list = []
-    if direction != "all":
-        chart_where.append("direction = ?")
-        chart_params.append(direction)
     if parent_value != "all":
         chart_where.append(f"{parent_col} = ?")
         chart_params.append(parent_value)
     chart_where_sql = f"WHERE {' AND '.join(chart_where)}" if chart_where else ""
     chart_rows = con.execute(
         f"""
-        SELECT year, COUNT(*) AS anomalies_count, SUM(abs_change_real) AS abs_change_sum
+        SELECT
+            year,
+            COUNT(*) AS anomalies_count,
+            SUM(abs_change_real) AS abs_change_sum,
+            SUM(CASE WHEN yoy_real_change > 0 THEN ABS(yoy_real_change) ELSE 0 END) AS abs_change_increase,
+            SUM(CASE WHEN yoy_real_change < 0 THEN ABS(yoy_real_change) ELSE 0 END) AS abs_change_decrease
         FROM anomalies
         {chart_where_sql}
         GROUP BY year
@@ -1033,6 +1035,8 @@ def anomalies():
     chart_labels = [str(int(r[0])) for r in chart_rows]
     chart_counts = [int(r[1] or 0) for r in chart_rows]
     chart_abs_change = [float(r[2] or 0) for r in chart_rows]
+    chart_abs_increase = [float(r[3] or 0) for r in chart_rows]
+    chart_abs_decrease = [float(r[4] or 0) for r in chart_rows]
 
     base_params = {
         "year": year,
@@ -1064,6 +1068,8 @@ def anomalies():
         chart_labels_json=json.dumps(chart_labels),
         chart_counts_json=json.dumps(chart_counts),
         chart_abs_change_json=json.dumps(chart_abs_change),
+        chart_abs_increase_json=json.dumps(chart_abs_increase),
+        chart_abs_decrease_json=json.dumps(chart_abs_decrease),
     )
 
 

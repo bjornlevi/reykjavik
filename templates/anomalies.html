@@ -372,6 +372,26 @@
                 backgroundColor: "rgba(15, 118, 110, 0.12)",
                 tension: 0.2,
                 fill: false
+              },
+              {
+                type: "line",
+                label: "Increase abs real change",
+                data: {{ chart_abs_increase_json | safe }},
+                yAxisID: "y1",
+                borderColor: "#15803d",
+                backgroundColor: "rgba(21, 128, 61, 0.08)",
+                tension: 0.2,
+                fill: false
+              },
+              {
+                type: "line",
+                label: "Decrease abs real change",
+                data: {{ chart_abs_decrease_json | safe }},
+                yAxisID: "y1",
+                borderColor: "#b91c1c",
+                backgroundColor: "rgba(185, 28, 28, 0.08)",
+                tension: 0.2,
+                fill: false
               }
             ]
           },
