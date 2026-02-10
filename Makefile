@@ -6,7 +6,7 @@ PROCESSED_DIR ?= data/processed
 
 .PHONY: pipeline download prepare lookup anomalies clean serve
 
-pipeline: download prepare lookup
+pipeline: download prepare lookup anomalies
 
 requirements:
 	$(PY) -m pip install -r requirements.txt
