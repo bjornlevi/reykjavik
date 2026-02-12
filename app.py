@@ -47,6 +47,9 @@ DISPLAY_NAMES = {
     "samtala0": "Institution",
     "samtala1": "Division",
     "samtala2": "Department",
+    "samtala2_raw": "Department (raw)",
+    "samtala2_canonical": "Department",
+    "samtala2_family": "Department",
     "samtala3": "Unit",
     "tegund0": "Group",
     "tegund1": "Type",
@@ -57,11 +60,37 @@ DISPLAY_NAMES = {
     "vm_nafn": "VSK name",
     "raun": "Actual",
 }
+DEPARTMENT_CANONICAL_MAP = {
+    "Frístund": "Frístundastarf",
+    "Búsetuúrræði": "Búsetuþjónusta",
+    "Heimaþjónusta - Heimahjúkrun": "Heimaþjónusta og Heimahjúkrun",
+    "Heimastuðningur": "Heimaþjónusta og Heimahjúkrun",
+    "Heimahjúkrun": "Heimaþjónusta og Heimahjúkrun",
+}
+DEPARTMENT_FAMILY_MAP = {
+    "Frístund": "Frístund / Frístundastarf",
+    "Frístundastarf": "Frístund / Frístundastarf",
+    "Búsetuúrræði": "Búsetuúrræði / Búsetuþjónusta",
+    "Búsetuþjónusta": "Búsetuúrræði / Búsetuþjónusta",
+    "Heimaþjónusta - Heimahjúkrun": "Heimaþjónusta / Heimastuðningur",
+    "Heimaþjónusta og Heimahjúkrun": "Heimaþjónusta / Heimastuðningur",
+    "Heimastuðningur": "Heimaþjónusta / Heimastuðningur",
+    "Heimahjúkrun": "Heimaþjónusta / Heimastuðningur",
+}
+DEPARTMENT_MODE = os.getenv("REYKJAVIK_DEPARTMENT_MODE", "canonical").strip().lower()
+DEPARTMENT_COLUMN_BY_MODE = {
+    "raw": "samtala2_raw",
+    "canonical": "samtala2_canonical",
+    "family": "samtala2_family",
+}
+if DEPARTMENT_MODE not in DEPARTMENT_COLUMN_BY_MODE:
+    DEPARTMENT_MODE = "canonical"
+DEPARTMENT_COLUMN = DEPARTMENT_COLUMN_BY_MODE[DEPARTMENT_MODE]
 CLICKABLE_COLUMNS = {
     "fyrirtaeki",
     "samtala0",
     "samtala1",
-    "samtala2",
+    DEPARTMENT_COLUMN,
     "samtala3",
     "tegund0",
     "tegund1",
@@ -74,7 +103,7 @@ FILTER_COLUMNS = [
     "fyrirtaeki",
     "samtala0",
     "samtala1",
-    "samtala2",
+    DEPARTMENT_COLUMN,
     "samtala3",
     "tegund0",
     "tegund1",
@@ -90,7 +119,7 @@ ANALYSIS_PARENT_COLUMNS = {
 ANALYSIS_CHILD_COLUMNS = [
     "samtala0",
     "samtala1",
-    "samtala2",
+    DEPARTMENT_COLUMN,
     "samtala3",
     "tegund1",
     "tegund2",
@@ -99,7 +128,7 @@ ANALYSIS_CHILD_COLUMNS = [
 ANOMALY_PARENT_COLUMNS = [
     "samtala0",
     "samtala1",
-    "samtala2",
+    DEPARTMENT_COLUMN,
     "samtala3",
     "tegund0",
     "tegund1",
@@ -108,6 +137,35 @@ ANOMALY_PARENT_COLUMNS = [
     "vm_nafn",
     "vm_numer",
 ]
+
+
+def _sql_string_literal(value: str) -> str:
+    return value.replace("'", "''")
+
+
+def _build_case_expr(column_expr: str, mapping: dict[str, str]) -> str:
+    if not mapping:
+        return f"TRIM({column_expr})"
+    parts = ["CASE"]
+    for src, dst in mapping.items():
+        parts.append(
+            f"WHEN TRIM({column_expr}) = '{_sql_string_literal(src)}' THEN '{_sql_string_literal(dst)}'"
+        )
+    parts.append(f"ELSE TRIM({column_expr}) END")
+    return " ".join(parts)
+
+
+def _mapped_source_select_sql(read_sql: str, alias: str = "t") -> str:
+    canonical_expr = _build_case_expr(f"{alias}.samtala2", DEPARTMENT_CANONICAL_MAP)
+    family_expr = _build_case_expr(f"{alias}.samtala2", DEPARTMENT_FAMILY_MAP)
+    return f"""
+        SELECT
+            {alias}.*,
+            TRIM({alias}.samtala2) AS samtala2_raw,
+            {canonical_expr} AS samtala2_canonical,
+            {family_expr} AS samtala2_family
+        FROM {read_sql} {alias}
+    """.strip()
 
 
 def _display_name(col: str) -> str:
@@ -142,6 +200,8 @@ def _is_excluded_column(name: str) -> bool:
         "ingested_at",
         "year",
     }:
+        return True
+    if name in {"samtala2_raw", "samtala2_canonical", "samtala2_family"} and name != DEPARTMENT_COLUMN:
         return True
     return name.startswith("x")
 
@@ -179,7 +239,7 @@ def _category_candidates(con: duckdb.DuckDBPyConnection) -> list[str]:
         "fyrirtaeki",
         "samtala0",
         "samtala1",
-        "samtala2",
+        DEPARTMENT_COLUMN,
         "samtala3",
         "tegund0",
         "tegund1",
@@ -209,7 +269,8 @@ def get_connection(parquet_path: str) -> duckdb.DuckDBPyConnection:
         return con
     con.execute("PRAGMA threads=4")
     safe_path = str(path).replace("'", "''")
-    con.execute(f"CREATE OR REPLACE VIEW arsuppgjor AS SELECT * FROM read_parquet('{safe_path}')")
+    select_sql = _mapped_source_select_sql(f"read_parquet('{safe_path}')", alias="t")
+    con.execute(f"CREATE OR REPLACE VIEW arsuppgjor AS {select_sql}")
     return con
 
 
@@ -229,7 +290,8 @@ def get_anomaly_connection(parquet_path: str) -> duckdb.DuckDBPyConnection:
         return con
     con.execute("PRAGMA threads=4")
     safe_path = str(path).replace("'", "''")
-    con.execute(f"CREATE OR REPLACE VIEW anomalies AS SELECT * FROM read_parquet('{safe_path}')")
+    select_sql = _mapped_source_select_sql(f"read_parquet('{safe_path}')", alias="t")
+    con.execute(f"CREATE OR REPLACE VIEW anomalies AS {select_sql}")
     return con
 
 
@@ -249,7 +311,8 @@ def get_anomaly_all_connection(parquet_path: str) -> duckdb.DuckDBPyConnection:
         return con
     con.execute("PRAGMA threads=4")
     safe_path = str(path).replace("'", "''")
-    con.execute(f"CREATE OR REPLACE VIEW anomalies_all AS SELECT * FROM read_parquet('{safe_path}')")
+    select_sql = _mapped_source_select_sql(f"read_parquet('{safe_path}')", alias="t")
+    con.execute(f"CREATE OR REPLACE VIEW anomalies_all AS {select_sql}")
     return con
 
 
@@ -343,7 +406,7 @@ def _select_preview_columns(
         if len(preferred) >= limit:
             break
     # Ensure samtala0-3 appear after ingested_at and before tegund1 if present.
-    samtala_order = ["samtala0", "samtala1", "samtala2", "samtala3"]
+    samtala_order = ["samtala0", "samtala1", DEPARTMENT_COLUMN, "samtala3"]
     if any(col in preferred for col in samtala_order):
         preferred = [col for col in preferred if col not in samtala_order]
         insert_after = "ingested_at" if "ingested_at" in preferred else None
@@ -449,7 +512,13 @@ def _analysis_url(base: dict, **updates) -> str:
 def _anomalies_url(base: dict, **updates) -> str:
     params = dict(base)
     params.update(updates)
-    return url_for("anomalies")
+    return url_for("anomalies", **params)
+
+
+def _reports_url(base: dict, **updates) -> str:
+    params = dict(base)
+    params.update(updates)
+    return url_for("reports", **params)
 
 
 def _analysis_scope_from_request(
@@ -782,7 +851,11 @@ def analysis():
         table_where += " AND year = ?"
         table_params.append(int(analysis_year))
 
-    record_columns = [c for c in ["year", parent_col, child_key, "samtala2", "samtala3", "tegund1", "tegund2", "tegund3", "vm_nafn", "vm_numer", "raun"] if c in columns]
+    record_columns = [
+        c
+        for c in ["year", parent_col, child_key, DEPARTMENT_COLUMN, "samtala3", "tegund1", "tegund2", "tegund3", "vm_nafn", "vm_numer", "raun"]
+        if c in columns
+    ]
     breakdown_query = f"""
         SELECT {child_key} AS child_value, SUM({numeric_expr}) AS actual_sum, COUNT(*) AS row_count
         FROM arsuppgjor
@@ -886,7 +959,26 @@ def analysis_export():
         scope_where += " AND year = ?"
         scope_params.append(int(analysis_year))
 
-    export_columns = [c for c in ["year", parent_col, child_key, "samtala0", "samtala1", "samtala2", "samtala3", "tegund0", "tegund1", "tegund2", "tegund3", "vm_nafn", "vm_numer", "raun"] if c in columns]
+    export_columns = [
+        c
+        for c in [
+            "year",
+            parent_col,
+            child_key,
+            "samtala0",
+            "samtala1",
+            DEPARTMENT_COLUMN,
+            "samtala3",
+            "tegund0",
+            "tegund1",
+            "tegund2",
+            "tegund3",
+            "vm_nafn",
+            "vm_numer",
+            "raun",
+        ]
+        if c in columns
+    ]
     query = f"SELECT {', '.join(export_columns)} FROM arsuppgjor WHERE {scope_where} ORDER BY year DESC"
     csv_text = con.execute(query, scope_params).fetchdf().to_csv(index=False)
     filename = f"analysis_{parent_col}.csv"
@@ -944,9 +1036,11 @@ def anomalies():
         page = total_pages
     offset = (page - 1) * page_size
 
+    row_dims = ["samtala0", "samtala1", DEPARTMENT_COLUMN, "samtala3", "tegund0", "tegund1", "tegund2", "tegund3", "vm_nafn", "vm_numer"]
+    row_dims = list(dict.fromkeys(row_dims))
     rows_query = f"""
         SELECT year, direction, anomaly_score, yoy_real_pct, yoy_real_change, actual_real, prior_real,
-               samtala0, samtala1, samtala2, samtala3, tegund0, tegund1, tegund2, tegund3, vm_nafn, vm_numer
+               {", ".join(row_dims)}
         FROM anomalies
         {where_sql}
         ORDER BY anomaly_score DESC, abs_change_real DESC
@@ -1112,6 +1206,534 @@ def anomalies_export():
         csv_text,
         mimetype="text/csv",
         headers={"Content-Disposition": "attachment; filename=anomalies_filtered.csv"},
+    )
+
+
+@app.route("/reports")
+def reports():
+    parquet_path = DEFAULT_PARQUET
+    con = get_connection(parquet_path)
+    if not _table_exists(con):
+        return render_template(
+            "reports.html",
+            data_loaded=False,
+            error=f"No data found at {parquet_path}. Run the pipeline first.",
+        )
+
+    columns = _get_columns(con)
+    required = {"tegund0", DEPARTMENT_COLUMN, "samtala0", "year", "raun"}
+    if not required.issubset(set(columns)):
+        return render_template(
+            "reports.html",
+            data_loaded=False,
+            error="Dataset is missing required columns for the Laun inspection.",
+        )
+
+    numeric_expr = _numeric_expr("raun")
+    excluded_departments = [
+        "Fasteignatekjur",
+        "Fasteignir í umsjón Eignaskrifstofu",
+        "Jöfnunarsjóðstekjur",
+        "Fasteignir",
+        "Útsvarstekjur",
+        "Áhöld, tæki og stofnbúnaður",
+        "Lóðir og lönd",
+        "Götur, göngul. og opin svæði",
+    ]
+    excluded_placeholders = ", ".join(["?"] * len(excluded_departments))
+
+    full_year_filter_sql = ""
+    if "period_month" in columns:
+        month_expr = "TRY_CAST(TRY_CAST(period_month AS DOUBLE) AS INTEGER)"
+        full_year_filter_sql = f"""
+            year IN (
+                SELECT year
+                FROM arsuppgjor
+                WHERE year IS NOT NULL
+                GROUP BY year
+                HAVING MAX({month_expr}) >= 12
+            )
+        """.strip()
+
+    def _avg_yoy_pct_for_scope(scope_clause: str, scope_params: list) -> float | None:
+        yearly_where = f"{scope_clause} AND year IS NOT NULL"
+        if full_year_filter_sql:
+            yearly_where += f" AND {full_year_filter_sql}"
+        avg_row = con.execute(
+            f"""
+            WITH yearly AS (
+                SELECT year, SUM(CASE WHEN tegund0 = 'Laun' THEN {numeric_expr} ELSE 0 END) AS laun_year_sum
+                FROM arsuppgjor
+                WHERE {yearly_where}
+                GROUP BY year
+            ),
+            deltas AS (
+                SELECT
+                    CASE
+                        WHEN LAG(laun_year_sum) OVER (ORDER BY year) IS NULL THEN NULL
+                        WHEN LAG(laun_year_sum) OVER (ORDER BY year) = 0 THEN NULL
+                        ELSE ((laun_year_sum / LAG(laun_year_sum) OVER (ORDER BY year)) - 1) * 100.0
+                    END AS yoy_pct
+                FROM yearly
+            )
+            SELECT AVG(yoy_pct) AS avg_yoy_pct
+            FROM deltas
+            WHERE yoy_pct IS NOT NULL
+            """,
+            scope_params,
+        ).fetchone()
+        if not avg_row:
+            return None
+        value = avg_row[0]
+        return None if value is None else float(value)
+
+    department = request.args.get("department", "").strip()
+    institution = request.args.get("institution", "").strip()
+    expanded_department = request.args.get("expanded_department", "").strip()
+    expanded_institution = request.args.get("expanded_institution", "").strip()
+    report_year = request.args.get("report_year", "all").strip()
+    try:
+        report_year_int = int(report_year) if report_year != "all" else None
+    except ValueError:
+        report_year = "all"
+        report_year_int = None
+    year_filter_sql = " AND CAST(a.year AS INTEGER) = ?" if report_year_int is not None else ""
+    year_filter_params = [report_year_int] if report_year_int is not None else []
+
+    dept_df = con.execute(
+        f"""
+        WITH yearly AS (
+            SELECT
+                {DEPARTMENT_COLUMN} AS department,
+                year,
+                SUM(CASE WHEN tegund0 = 'Laun' THEN {numeric_expr} ELSE 0 END) AS laun_year_sum
+            FROM arsuppgjor
+            WHERE
+                {DEPARTMENT_COLUMN} IS NOT NULL
+                AND {DEPARTMENT_COLUMN} NOT IN ({excluded_placeholders})
+                AND year IS NOT NULL
+                {f"AND {full_year_filter_sql}" if full_year_filter_sql else ""}
+            GROUP BY {DEPARTMENT_COLUMN}, year
+        ),
+        yearly_deltas AS (
+            SELECT
+                department,
+                CASE
+                    WHEN LAG(laun_year_sum) OVER (PARTITION BY department ORDER BY year) IS NULL THEN NULL
+                    WHEN LAG(laun_year_sum) OVER (PARTITION BY department ORDER BY year) = 0 THEN NULL
+                    ELSE (
+                        (laun_year_sum / LAG(laun_year_sum) OVER (PARTITION BY department ORDER BY year)) - 1
+                    ) * 100.0
+                END AS delta_pct
+            FROM yearly
+        ),
+        delta_avg AS (
+            SELECT department, AVG(delta_pct) AS avg_increase_pct
+            FROM yearly_deltas
+            WHERE delta_pct IS NOT NULL
+            GROUP BY department
+        ),
+        department_totals AS (
+            SELECT
+                a.{DEPARTMENT_COLUMN} AS department,
+                SUM(CASE WHEN a.tegund0 = 'Laun' THEN {numeric_expr} ELSE 0 END) AS actual_sum,
+                COUNT(*) AS row_count
+            FROM arsuppgjor a
+            WHERE a.{DEPARTMENT_COLUMN} IS NOT NULL AND a.{DEPARTMENT_COLUMN} NOT IN ({excluded_placeholders}){year_filter_sql}
+            GROUP BY a.{DEPARTMENT_COLUMN}
+        ),
+        cost_basis AS (
+            SELECT
+                a.{DEPARTMENT_COLUMN} AS department,
+                CAST(a.year AS INTEGER) AS year,
+                COALESCE(a.samtala0, '') AS k_samtala0,
+                COALESCE(a.samtala1, '') AS k_samtala1,
+                COALESCE(a.samtala3, '') AS k_samtala3,
+                COALESCE(a.tegund1, '') AS k_tegund1,
+                COALESCE(a.tegund2, '') AS k_tegund2,
+                COALESCE(a.tegund3, '') AS k_tegund3,
+                COALESCE(a.vm_numer, '') AS k_vm_numer,
+                SUM(CASE WHEN a.tegund0 = 'Laun' THEN {numeric_expr} ELSE 0 END) AS laun_net_detail,
+                SUM(CASE WHEN a.tegund0 <> 'Laun' OR a.tegund0 IS NULL THEN {numeric_expr} ELSE 0 END) AS other_net_detail
+            FROM arsuppgjor a
+            WHERE a.{DEPARTMENT_COLUMN} IS NOT NULL AND a.{DEPARTMENT_COLUMN} NOT IN ({excluded_placeholders}) AND a.year IS NOT NULL{year_filter_sql}
+            GROUP BY
+                a.{DEPARTMENT_COLUMN},
+                CAST(a.year AS INTEGER),
+                COALESCE(a.samtala0, ''),
+                COALESCE(a.samtala1, ''),
+                COALESCE(a.samtala3, ''),
+                COALESCE(a.tegund1, ''),
+                COALESCE(a.tegund2, ''),
+                COALESCE(a.tegund3, ''),
+                COALESCE(a.vm_numer, '')
+        ),
+        cost_totals AS (
+            SELECT
+                department,
+                SUM(GREATEST(laun_net_detail, 0)) AS laun_cost_sum,
+                SUM(GREATEST(other_net_detail, 0)) AS other_sum
+            FROM cost_basis
+            GROUP BY department
+        )
+        SELECT
+            t.department AS department,
+            t.actual_sum AS actual_sum,
+            c.other_sum AS other_sum,
+            c.laun_cost_sum AS laun_cost_sum,
+            t.row_count AS row_count,
+            d.avg_increase_pct AS avg_increase_pct
+        FROM department_totals t
+        LEFT JOIN delta_avg d ON d.department = t.department
+        LEFT JOIN cost_totals c ON c.department = t.department
+        ORDER BY actual_sum DESC NULLS LAST
+        """,
+        excluded_departments
+        + excluded_departments
+        + year_filter_params
+        + excluded_departments
+        + year_filter_params,
+    ).fetchdf()
+    department_rows = dept_df.to_dict(orient="records")
+    for row in department_rows:
+        row["actual_sum_fmt"] = _format_number(row.get("actual_sum"))
+        avg_increase_pct = row.get("avg_increase_pct")
+        row["avg_increase_fmt"] = "" if avg_increase_pct is None else f"{float(avg_increase_pct):.1f}%"
+        row["other_sum_fmt"] = _format_number(row.get("other_sum"))
+        total_sum = (row.get("laun_cost_sum") or 0) + (row.get("other_sum") or 0)
+        row["laun_share_pct"] = (float(row.get("laun_cost_sum") or 0) / total_sum * 100.0) if total_sum else 0.0
+        row["laun_share_pct_fmt"] = f"{row['laun_share_pct']:.1f}%"
+    dept_total_actual = sum(float(r.get("actual_sum") or 0) for r in department_rows)
+    dept_total_other = sum(float(r.get("other_sum") or 0) for r in department_rows)
+    dept_total_laun_cost = sum(float(r.get("laun_cost_sum") or 0) for r in department_rows)
+    dept_total_rows = int(sum(int(r.get("row_count") or 0) for r in department_rows))
+    dept_total_den = dept_total_laun_cost + dept_total_other
+    dept_total_share = (dept_total_laun_cost / dept_total_den * 100.0) if dept_total_den else 0.0
+    dept_total_avg = _avg_yoy_pct_for_scope(
+        f"{DEPARTMENT_COLUMN} IS NOT NULL AND {DEPARTMENT_COLUMN} NOT IN ({excluded_placeholders})",
+        excluded_departments,
+    )
+    department_total_row = {
+        "label": "Total",
+        "actual_sum_fmt": _format_number(dept_total_actual),
+        "avg_increase_fmt": "" if dept_total_avg is None else f"{dept_total_avg:.1f}%",
+        "other_sum_fmt": _format_number(dept_total_other),
+        "laun_share_pct_fmt": f"{dept_total_share:.1f}%",
+        "row_count": dept_total_rows,
+    }
+
+    if department and (department in set(excluded_departments) or department not in set(dept_df["department"].astype(str))):
+        department = ""
+    if expanded_department and (
+        expanded_department in set(excluded_departments)
+        or expanded_department not in set(dept_df["department"].astype(str))
+    ):
+        expanded_department = ""
+    if expanded_department and not department:
+        department = expanded_department
+
+    institution_rows = []
+    institution_total_row = None
+    if department:
+        inst_df = con.execute(
+            f"""
+            WITH yearly AS (
+                SELECT
+                    samtala0 AS institution,
+                    year,
+                    SUM(CASE WHEN tegund0 = 'Laun' THEN {numeric_expr} ELSE 0 END) AS laun_year_sum
+                FROM arsuppgjor
+                WHERE {DEPARTMENT_COLUMN} = ? AND samtala0 IS NOT NULL AND year IS NOT NULL {f"AND {full_year_filter_sql}" if full_year_filter_sql else ""}
+                GROUP BY samtala0, year
+            ),
+            yearly_deltas AS (
+                SELECT
+                    institution,
+                    CASE
+                        WHEN LAG(laun_year_sum) OVER (PARTITION BY institution ORDER BY year) IS NULL THEN NULL
+                        WHEN LAG(laun_year_sum) OVER (PARTITION BY institution ORDER BY year) = 0 THEN NULL
+                        ELSE (
+                            (laun_year_sum / LAG(laun_year_sum) OVER (PARTITION BY institution ORDER BY year)) - 1
+                        ) * 100.0
+                    END AS delta_pct
+                FROM yearly
+            ),
+            delta_avg AS (
+                SELECT institution, AVG(delta_pct) AS avg_increase_pct
+                FROM yearly_deltas
+                WHERE delta_pct IS NOT NULL
+                GROUP BY institution
+            ),
+            institution_totals AS (
+                SELECT
+                    a.samtala0 AS institution,
+                    SUM(CASE WHEN a.tegund0 = 'Laun' THEN {numeric_expr} ELSE 0 END) AS actual_sum,
+                    COUNT(*) AS row_count
+                FROM arsuppgjor a
+                WHERE a.{DEPARTMENT_COLUMN} = ? AND a.samtala0 IS NOT NULL{year_filter_sql}
+                GROUP BY a.samtala0
+            ),
+            cost_basis AS (
+                SELECT
+                    a.samtala0 AS institution,
+                    CAST(a.year AS INTEGER) AS year,
+                    COALESCE(a.samtala1, '') AS k_samtala1,
+                    COALESCE(a.samtala3, '') AS k_samtala3,
+                    COALESCE(a.tegund1, '') AS k_tegund1,
+                    COALESCE(a.tegund2, '') AS k_tegund2,
+                    COALESCE(a.tegund3, '') AS k_tegund3,
+                    COALESCE(a.vm_numer, '') AS k_vm_numer,
+                    SUM(CASE WHEN a.tegund0 = 'Laun' THEN {numeric_expr} ELSE 0 END) AS laun_net_detail,
+                    SUM(CASE WHEN a.tegund0 <> 'Laun' OR a.tegund0 IS NULL THEN {numeric_expr} ELSE 0 END) AS other_net_detail
+                FROM arsuppgjor a
+                WHERE a.{DEPARTMENT_COLUMN} = ? AND a.samtala0 IS NOT NULL AND a.year IS NOT NULL{year_filter_sql}
+                GROUP BY
+                    a.samtala0,
+                    CAST(a.year AS INTEGER),
+                    COALESCE(a.samtala1, ''),
+                    COALESCE(a.samtala3, ''),
+                    COALESCE(a.tegund1, ''),
+                    COALESCE(a.tegund2, ''),
+                    COALESCE(a.tegund3, ''),
+                    COALESCE(a.vm_numer, '')
+            ),
+            cost_totals AS (
+                SELECT
+                    institution,
+                    SUM(GREATEST(laun_net_detail, 0)) AS laun_cost_sum,
+                    SUM(GREATEST(other_net_detail, 0)) AS other_sum
+                FROM cost_basis
+                GROUP BY institution
+            )
+            SELECT
+                t.institution AS institution,
+                t.actual_sum AS actual_sum,
+                c.other_sum AS other_sum,
+                c.laun_cost_sum AS laun_cost_sum,
+                t.row_count AS row_count,
+                d.avg_increase_pct AS avg_increase_pct
+            FROM institution_totals t
+            LEFT JOIN delta_avg d ON d.institution = t.institution
+            LEFT JOIN cost_totals c ON c.institution = t.institution
+            ORDER BY actual_sum DESC NULLS LAST
+            """,
+            [department, department, *year_filter_params, department, *year_filter_params],
+        ).fetchdf()
+        institution_rows = inst_df.to_dict(orient="records")
+        for row in institution_rows:
+            row["actual_sum_fmt"] = _format_number(row.get("actual_sum"))
+            avg_increase_pct = row.get("avg_increase_pct")
+            row["avg_increase_fmt"] = "" if avg_increase_pct is None else f"{float(avg_increase_pct):.1f}%"
+            row["other_sum_fmt"] = _format_number(row.get("other_sum"))
+            total_sum = (row.get("laun_cost_sum") or 0) + (row.get("other_sum") or 0)
+            row["laun_share_pct"] = (float(row.get("laun_cost_sum") or 0) / total_sum * 100.0) if total_sum else 0.0
+            row["laun_share_pct_fmt"] = f"{row['laun_share_pct']:.1f}%"
+        inst_total_actual = sum(float(r.get("actual_sum") or 0) for r in institution_rows)
+        inst_total_other = sum(float(r.get("other_sum") or 0) for r in institution_rows)
+        inst_total_laun_cost = sum(float(r.get("laun_cost_sum") or 0) for r in institution_rows)
+        inst_total_rows = int(sum(int(r.get("row_count") or 0) for r in institution_rows))
+        inst_total_den = inst_total_laun_cost + inst_total_other
+        inst_total_share = (inst_total_laun_cost / inst_total_den * 100.0) if inst_total_den else 0.0
+        inst_total_avg = _avg_yoy_pct_for_scope(f"{DEPARTMENT_COLUMN} = ? AND samtala0 IS NOT NULL", [department])
+        institution_total_row = {
+            "label": "Total",
+            "actual_sum_fmt": _format_number(inst_total_actual),
+            "avg_increase_fmt": "" if inst_total_avg is None else f"{inst_total_avg:.1f}%",
+            "other_sum_fmt": _format_number(inst_total_other),
+            "laun_share_pct_fmt": f"{inst_total_share:.1f}%",
+            "row_count": inst_total_rows,
+        }
+        if institution and institution not in set(inst_df["institution"].astype(str)):
+            institution = ""
+    else:
+        institution = ""
+    if expanded_institution and not expanded_department:
+        expanded_institution = ""
+    if expanded_institution and institution == "":
+        institution = expanded_institution
+
+    expanded_institution_rows = []
+    expanded_actual_rows = []
+    expanded_actual_columns = []
+    expanded_actual_total = 0
+    if expanded_department:
+        expanded_inst_df = con.execute(
+            f"""
+            WITH institution_totals AS (
+                SELECT
+                    a.samtala0 AS institution,
+                    SUM(CASE WHEN a.tegund0 = 'Laun' THEN {numeric_expr} ELSE 0 END) AS actual_sum,
+                    COUNT(*) AS row_count
+                FROM arsuppgjor a
+                WHERE a.{DEPARTMENT_COLUMN} = ? AND a.samtala0 IS NOT NULL{year_filter_sql}
+                GROUP BY a.samtala0
+            ),
+            cost_basis AS (
+                SELECT
+                    a.samtala0 AS institution,
+                    CAST(a.year AS INTEGER) AS year,
+                    COALESCE(a.samtala1, '') AS k_samtala1,
+                    COALESCE(a.samtala3, '') AS k_samtala3,
+                    COALESCE(a.tegund1, '') AS k_tegund1,
+                    COALESCE(a.tegund2, '') AS k_tegund2,
+                    COALESCE(a.tegund3, '') AS k_tegund3,
+                    COALESCE(a.vm_numer, '') AS k_vm_numer,
+                    SUM(CASE WHEN a.tegund0 = 'Laun' THEN {numeric_expr} ELSE 0 END) AS laun_net_detail,
+                    SUM(CASE WHEN a.tegund0 <> 'Laun' OR a.tegund0 IS NULL THEN {numeric_expr} ELSE 0 END) AS other_net_detail
+                FROM arsuppgjor a
+                WHERE a.{DEPARTMENT_COLUMN} = ? AND a.samtala0 IS NOT NULL AND a.year IS NOT NULL{year_filter_sql}
+                GROUP BY
+                    a.samtala0,
+                    CAST(a.year AS INTEGER),
+                    COALESCE(a.samtala1, ''),
+                    COALESCE(a.samtala3, ''),
+                    COALESCE(a.tegund1, ''),
+                    COALESCE(a.tegund2, ''),
+                    COALESCE(a.tegund3, ''),
+                    COALESCE(a.vm_numer, '')
+            ),
+            cost_totals AS (
+                SELECT
+                    institution,
+                    SUM(GREATEST(laun_net_detail, 0)) AS laun_cost_sum,
+                    SUM(GREATEST(other_net_detail, 0)) AS other_sum
+                FROM cost_basis
+                GROUP BY institution
+            )
+            SELECT
+                t.institution AS institution,
+                t.actual_sum AS actual_sum,
+                t.row_count AS row_count,
+                c.laun_cost_sum AS laun_cost_sum,
+                c.other_sum AS other_sum
+            FROM institution_totals t
+            LEFT JOIN cost_totals c ON c.institution = t.institution
+            ORDER BY actual_sum DESC NULLS LAST
+            """,
+            [expanded_department, *year_filter_params, expanded_department, *year_filter_params],
+        ).fetchdf()
+        expanded_institution_rows = expanded_inst_df.to_dict(orient="records")
+        for row in expanded_institution_rows:
+            row["actual_sum_fmt"] = _format_number(row.get("actual_sum"))
+            share_den = (row.get("laun_cost_sum") or 0) + (row.get("other_sum") or 0)
+            row["laun_share_pct"] = (float(row.get("laun_cost_sum") or 0) / share_den * 100.0) if share_den else 0.0
+            row["laun_share_pct_fmt"] = f"{row['laun_share_pct']:.1f}%"
+
+        if expanded_institution and expanded_institution not in set(expanded_inst_df["institution"].astype(str)):
+            expanded_institution = ""
+        elif expanded_institution and not institution:
+            institution = expanded_institution
+
+        row_scope_where = [f"{DEPARTMENT_COLUMN} = ?"]
+        row_scope_params: list = [expanded_department]
+        if expanded_institution:
+            row_scope_where.append("samtala0 = ?")
+            row_scope_params.append(expanded_institution)
+        if report_year_int is not None:
+            row_scope_where.append("CAST(year AS INTEGER) = ?")
+            row_scope_params.append(report_year_int)
+        where_sql = " AND ".join(row_scope_where)
+        expanded_actual_columns = [
+            c
+            for c in [
+                "year",
+                "samtala0",
+                "samtala1",
+                DEPARTMENT_COLUMN,
+                "samtala3",
+                "tegund0",
+                "tegund1",
+                "tegund2",
+                "tegund3",
+                "vm_nafn",
+                "vm_numer",
+                "raun",
+            ]
+            if c in columns
+        ]
+        expanded_actual_total = int(
+            con.execute(
+                f"SELECT COUNT(*) FROM arsuppgjor WHERE {where_sql}",
+                row_scope_params,
+            ).fetchone()[0]
+            or 0
+        )
+        if expanded_actual_columns:
+            expanded_actual_rows = con.execute(
+                f"""
+                SELECT {", ".join(expanded_actual_columns)}
+                FROM arsuppgjor
+                WHERE {where_sql}
+                ORDER BY year DESC
+                LIMIT 200
+                """,
+                row_scope_params,
+            ).fetchdf().to_dict(orient="records")
+            expanded_actual_rows = _format_preview_rows(expanded_actual_rows, expanded_actual_columns)
+
+    base_filter = f"tegund0 = 'Laun' AND {DEPARTMENT_COLUMN} NOT IN ({excluded_placeholders})"
+    scope_where = f"{base_filter}"
+    params: list = list(excluded_departments)
+    scope_label = "Laun"
+    if department:
+        scope_where += f" AND {DEPARTMENT_COLUMN} = ?"
+        params.append(department)
+        scope_label += f" | {_display_name(DEPARTMENT_COLUMN)}: {department}"
+    if institution:
+        scope_where += " AND samtala0 = ?"
+        params.append(institution)
+        scope_label += f" | {_display_name('samtala0')}: {institution}"
+
+    yearly_df = con.execute(
+        f"""
+        SELECT year, SUM({numeric_expr}) AS actual_sum
+        FROM arsuppgjor
+        WHERE {scope_where} AND year IS NOT NULL
+        GROUP BY year
+        ORDER BY year
+        """,
+        params,
+    ).fetchdf()
+    yearly_rows = yearly_df.to_dict(orient="records")
+    for row in yearly_rows:
+        row["actual_sum_fmt"] = _format_number(row.get("actual_sum"))
+    yearly_labels = [str(int(y)) for y in yearly_df["year"].tolist()] if not yearly_df.empty else []
+    yearly_values = [float(v or 0) for v in yearly_df["actual_sum"].tolist()] if not yearly_df.empty else []
+
+    base_params = {
+        "department": department,
+        "institution": institution,
+        "expanded_department": expanded_department,
+        "expanded_institution": expanded_institution,
+        "report_year": report_year,
+    }
+    return render_template(
+        "reports.html",
+        data_loaded=True,
+        inspection_name="Laun by Department/Institution",
+        department=department,
+        institution=institution,
+        department_rows=department_rows,
+        department_total_row=department_total_row,
+        institution_rows=institution_rows,
+        institution_total_row=institution_total_row,
+        expanded_department=expanded_department,
+        expanded_institution=expanded_institution,
+        expanded_institution_rows=expanded_institution_rows,
+        expanded_actual_rows=expanded_actual_rows,
+        expanded_actual_columns=expanded_actual_columns,
+        expanded_actual_total=expanded_actual_total,
+        yearly_rows=yearly_rows,
+        report_year=report_year,
+        report_year_links=["all"] + yearly_labels,
+        yearly_labels_json=json.dumps(yearly_labels),
+        yearly_values_json=json.dumps(yearly_values),
+        scope_label=scope_label,
+        department_label=_display_name(DEPARTMENT_COLUMN),
+        institution_label=_display_name("samtala0"),
+        build_reports_url=_reports_url,
+        base_params=base_params,
+        display_name=_display_name,
     )
 
 
