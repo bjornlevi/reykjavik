@@ -225,6 +225,15 @@
             <div class="empty">No yearly data for this scope.</div>
           {% endif %}
 
+          <div class="section-title">Laun % of total by year{% if share_scope_label %} ({{ share_scope_label }}){% endif %}</div>
+          {% if share_level and share_values_json and share_values_json != "[]" %}
+            <div class="chart-wrap">
+              <canvas id="shareChart" class="chart"></canvas>
+            </div>
+          {% else %}
+            <div class="empty">Click a value in `Laun % of total` to plot yearly development.</div>
+          {% endif %}
+
           <div class="section-title">Year filter (table)</div>
           <div class="pill-grid">
             {% for y in report_year_links %}
@@ -262,7 +271,11 @@
                     <td class="num">{{ row["actual_sum_fmt"] }}</td>
                     <td class="num">{{ row["avg_increase_fmt"] }}</td>
                     <td class="num">{{ row["other_sum_fmt"] }}</td>
-                    <td class="num">{{ row["laun_share_pct_fmt"] }}</td>
+                    <td class="num">
+                      <a href="{{ build_reports_url(base_params, share_level='department', share_value=row['department'], share_department=row['department']) }}">
+                        {{ row["laun_share_pct_fmt"] }}
+                      </a>
+                    </td>
                     <td class="num">
                       <a href="{{ expand_url }}">{{ row["row_count"] }}</a>
                     </td>
@@ -291,7 +304,11 @@
                                       </a>
                                     </td>
                                     <td class="num">{{ child["actual_sum_fmt"] }}</td>
-                                    <td class="num">{{ child["laun_share_pct_fmt"] }}</td>
+                                    <td class="num">
+                                      <a href="{{ build_reports_url(base_params, share_level='institution', share_department=expanded_department, share_value=child['institution']) }}">
+                                        {{ child["laun_share_pct_fmt"] }}
+                                      </a>
+                                    </td>
                                     <td class="num">
                                       <a href="{{ build_reports_url(base_params, department=expanded_department, institution=child['institution'], expanded_department=expanded_department, expanded_institution=child['institution']) }}">
                                         {{ child["row_count"] }}
@@ -402,6 +419,40 @@
             }
           }
         });
+        {% if share_level and share_values_json and share_values_json != "[]" %}
+        new Chart(document.getElementById("shareChart"), {
+          type: "line",
+          data: {
+            labels: {{ share_labels_json | safe }},
+            datasets: [
+              {
+                label: "Laun % of total",
+                data: {{ share_values_json | safe }},
+                borderColor: "#0f766e",
+                backgroundColor: "rgba(15, 118, 110, 0.15)",
+                borderWidth: 2,
+                tension: 0.2,
+                fill: true,
+                pointRadius: 3
+              }
+            ]
+          },
+          options: {
+            maintainAspectRatio: false,
+            scales: {
+              y: {
+                beginAtZero: true,
+                ticks: {
+                  callback: (v) => `${v}%`
+                }
+              }
+            },
+            plugins: {
+              legend: { display: true }
+            }
+          }
+        });
+        {% endif %}
       </script>
     {% endif %}
     <script>

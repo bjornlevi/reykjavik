@@ -1299,6 +1299,13 @@ def reports():
         report_year_int = None
     year_filter_sql = " AND CAST(a.year AS INTEGER) = ?" if report_year_int is not None else ""
     year_filter_params = [report_year_int] if report_year_int is not None else []
+    share_level = request.args.get("share_level", "").strip().lower()
+    share_value = request.args.get("share_value", "").strip()
+    share_department = request.args.get("share_department", "").strip()
+    if share_level not in {"department", "institution"}:
+        share_level = ""
+        share_value = ""
+        share_department = ""
 
     dept_df = con.execute(
         f"""
@@ -1432,6 +1439,15 @@ def reports():
     if expanded_department and not department:
         department = expanded_department
 
+    valid_departments = set(dept_df["department"].astype(str))
+    if share_level == "department":
+        if not share_value or share_value not in valid_departments:
+            share_level = ""
+            share_value = ""
+            share_department = ""
+        else:
+            share_department = share_value
+
     institution_rows = []
     institution_total_row = None
     if department:
@@ -1551,6 +1567,21 @@ def reports():
         expanded_institution = ""
     if expanded_institution and institution == "":
         institution = expanded_institution
+
+    if share_level == "institution":
+        if not share_department or share_department not in valid_departments or not share_value:
+            share_level = ""
+            share_value = ""
+            share_department = ""
+        else:
+            check = con.execute(
+                f"SELECT 1 FROM arsuppgjor WHERE {DEPARTMENT_COLUMN} = ? AND samtala0 = ? LIMIT 1",
+                [share_department, share_value],
+            ).fetchone()
+            if not check:
+                share_level = ""
+                share_value = ""
+                share_department = ""
 
     expanded_institution_rows = []
     expanded_actual_rows = []
@@ -1700,12 +1731,77 @@ def reports():
     yearly_labels = [str(int(y)) for y in yearly_df["year"].tolist()] if not yearly_df.empty else []
     yearly_values = [float(v or 0) for v in yearly_df["actual_sum"].tolist()] if not yearly_df.empty else []
 
+    share_scope_label = ""
+    share_labels: list[str] = []
+    share_values: list[float] = []
+    if share_level:
+        share_where = ["a.year IS NOT NULL"]
+        share_params: list = []
+        if share_level == "department":
+            share_where.append(f"a.{DEPARTMENT_COLUMN} = ?")
+            share_params.append(share_value)
+            share_scope_label = f"{_display_name(DEPARTMENT_COLUMN)}: {share_value}"
+        elif share_level == "institution":
+            share_where.append(f"a.{DEPARTMENT_COLUMN} = ?")
+            share_where.append("a.samtala0 = ?")
+            share_params.extend([share_department, share_value])
+            share_scope_label = f"{_display_name('samtala0')}: {share_value} ({_display_name(DEPARTMENT_COLUMN)}: {share_department})"
+        share_df = con.execute(
+            f"""
+            WITH cost_basis AS (
+                SELECT
+                    CAST(a.year AS INTEGER) AS year,
+                    COALESCE(a.samtala1, '') AS k_samtala1,
+                    COALESCE(a.samtala3, '') AS k_samtala3,
+                    COALESCE(a.tegund1, '') AS k_tegund1,
+                    COALESCE(a.tegund2, '') AS k_tegund2,
+                    COALESCE(a.tegund3, '') AS k_tegund3,
+                    COALESCE(a.vm_numer, '') AS k_vm_numer,
+                    SUM(CASE WHEN a.tegund0 = 'Laun' THEN {numeric_expr} ELSE 0 END) AS laun_net_detail,
+                    SUM(CASE WHEN a.tegund0 <> 'Laun' OR a.tegund0 IS NULL THEN {numeric_expr} ELSE 0 END) AS other_net_detail
+                FROM arsuppgjor a
+                WHERE {" AND ".join(share_where)}
+                GROUP BY
+                    CAST(a.year AS INTEGER),
+                    COALESCE(a.samtala1, ''),
+                    COALESCE(a.samtala3, ''),
+                    COALESCE(a.tegund1, ''),
+                    COALESCE(a.tegund2, ''),
+                    COALESCE(a.tegund3, ''),
+                    COALESCE(a.vm_numer, '')
+            ),
+            yearly AS (
+                SELECT
+                    year,
+                    SUM(GREATEST(laun_net_detail, 0)) AS laun_cost_sum,
+                    SUM(GREATEST(other_net_detail, 0)) AS other_sum
+                FROM cost_basis
+                GROUP BY year
+            )
+            SELECT
+                year,
+                CASE
+                    WHEN (laun_cost_sum + other_sum) > 0 THEN (laun_cost_sum / (laun_cost_sum + other_sum)) * 100.0
+                    ELSE NULL
+                END AS laun_share_pct
+            FROM yearly
+            ORDER BY year
+            """,
+            share_params,
+        ).fetchdf()
+        if not share_df.empty:
+            share_labels = [str(int(y)) for y in share_df["year"].tolist()]
+            share_values = [float(v) if v is not None else 0.0 for v in share_df["laun_share_pct"].tolist()]
+
     base_params = {
         "department": department,
         "institution": institution,
         "expanded_department": expanded_department,
         "expanded_institution": expanded_institution,
         "report_year": report_year,
+        "share_level": share_level,
+        "share_value": share_value,
+        "share_department": share_department,
     }
     return render_template(
         "reports.html",
@@ -1726,6 +1822,12 @@ def reports():
         yearly_rows=yearly_rows,
         report_year=report_year,
         report_year_links=["all"] + yearly_labels,
+        share_level=share_level,
+        share_value=share_value,
+        share_department=share_department,
+        share_scope_label=share_scope_label,
+        share_labels_json=json.dumps(share_labels),
+        share_values_json=json.dumps(share_values),
         yearly_labels_json=json.dumps(yearly_labels),
         yearly_values_json=json.dumps(yearly_values),
         scope_label=scope_label,
